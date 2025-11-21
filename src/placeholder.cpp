@@ -5,6 +5,8 @@
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <RadioLib.h>  // Librería RadioLib para SX1262
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
 
 // ========== CONFIGURACIÓN LORA ==========
 // Pines SX1262 para Heltec WiFi LoRa 32 V3
@@ -62,10 +64,29 @@ const unsigned long WAYPOINT_TIMEOUT = 15000; // 15 segundos después del últim
 // Módulo SX1262
 SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY);
 
+// ========== CONFIGURACIÓN GPS ==========
+// Pines libres según pinout Heltec V3
+#define GPS_RX 2   // RX del GPS conectado a GPIO 2
+#define GPS_TX 1   // TX del GPS conectado a GPIO 1
+#define GPS_BAUD 9600
+
+// Objeto GPS
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1);  // Usar Serial1
+
+// Variables GPS
+float latActual = 0.0;
+float lonActual = 0.0;
+int satellites = 0;
+bool gpsFixed = false;
+unsigned long lastGPSUpdate = 0;
+
 // ========== DECLARACIONES FORWARD ==========
 void showMessage(const char *line1, const char *line2);
 void showMessage(String line1, String line2);
 void startMission();
+void updateGPS();
+void displayGPS();
 
 // ========== CONFIGURACIÓN MOTORES L298N ==========
 // Motor A (Motor Izquierdo)
@@ -74,7 +95,7 @@ const int M1_IN2 = 26;
 const int M1_ENA = 48;
 
 // Motor B (Motor Derecho)
-const int M2_IN1 = 21;
+const int M2_IN1 = 45;
 const int M2_IN2 = 20;
 const int M2_ENB = 47;
 
@@ -357,6 +378,79 @@ void turnRight(int speed = 150) {
   motorBackward(M2_IN1, M2_IN2, speed);  // Motor der atrás
 }
 
+// ========== FUNCIONES GPS ==========
+
+void updateGPS() {
+  // Leer datos del GPS
+  while (gpsSerial.available() > 0) {
+    char c = gpsSerial.read();
+    gps.encode(c);
+  }
+  
+  // Si hay nueva ubicación
+  if (gps.location.isUpdated()) {
+    latActual = gps.location.lat();
+    lonActual = gps.location.lng();
+    satellites = gps.satellites.value();
+    gpsFixed = gps.location.isValid();
+    lastGPSUpdate = millis();
+    
+    // Mostrar en Serial
+    Serial.print("[GPS] Lat: ");
+    Serial.print(latActual, 6);
+    Serial.print(" Lon: ");
+    Serial.print(lonActual, 6);
+    Serial.print(" Sats: ");
+    Serial.print(satellites);
+    Serial.print(" HDOP: ");
+    Serial.println(gps.hdop.hdop());
+  }
+}
+
+void displayGPS() {
+  if (!oledWorking) return;
+  
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  
+  // Título
+  u8g2.drawStr(0, 10, "GPS NEO-6M");
+  
+  if (gpsFixed) {
+    // Latitud
+    u8g2.drawStr(0, 24, "Lat:");
+    String latStr = String(latActual, 6);
+    u8g2.drawStr(30, 24, latStr.c_str());
+    
+    // Longitud
+    u8g2.drawStr(0, 38, "Lon:");
+    String lonStr = String(lonActual, 6);
+    u8g2.drawStr(30, 38, lonStr.c_str());
+    
+    // Satélites
+    u8g2.drawStr(0, 52, "Sats:");
+    String satStr = String(satellites);
+    u8g2.drawStr(40, 52, satStr.c_str());
+    
+    // HDOP (precisión)
+    u8g2.drawStr(70, 52, "HD:");
+    String hdopStr = String(gps.hdop.hdop(), 1);
+    u8g2.drawStr(95, 52, hdopStr.c_str());
+    
+  } else {
+    // Sin Fix
+    u8g2.drawStr(0, 30, "Buscando");
+    u8g2.drawStr(0, 45, "satelites...");
+    
+    if (satellites > 0) {
+      String satStr = "Sats: " + String(satellites);
+      u8g2.drawStr(0, 60, satStr.c_str());
+    }
+  }
+  
+  u8g2.sendBuffer();
+}
+
 // ========== FUNCIONES DE INICIALIZACIÓN ==========
 
 void scanI2C() {
@@ -442,6 +536,136 @@ void initMotors() {
   Serial.println("[Motor] OK");
 }
 
+void initGPS() {
+  Serial.println("[GPS] Inicializando NEO-6M...");
+  Serial.println("[GPS] Probando diferentes baudrates...");
+  
+  // Lista de baudrates comunes para GPS
+  int baudrates[] = {4800, 9600, 38400, 57600, 115200};
+  
+  for (int i = 0; i < 5; i++) {
+    Serial.print("[GPS] Probando ");
+    Serial.print(baudrates[i]);
+    Serial.println(" bps...");
+    
+    // Iniciar con este baudrate
+    gpsSerial.begin(baudrates[i], SERIAL_8N1, GPS_RX, GPS_TX);
+    delay(500);
+    
+    // Leer datos durante 2 segundos
+    unsigned long start = millis();
+    bool foundNMEA = false;
+    String testData = "";
+    
+    while (millis() - start < 2000) {
+      while (gpsSerial.available()) {
+        char c = gpsSerial.read();
+        testData += c;
+        
+        // Buscar inicio de trama NMEA
+        if (c == '$') {
+          foundNMEA = true;
+        }
+      }
+      
+      if (foundNMEA) break;
+    }
+    
+    if (foundNMEA) {
+      Serial.println("[GPS] ✓ ¡NMEA detectado!");
+      Serial.print("[GPS] Datos recibidos: ");
+      Serial.println(testData.substring(0, 80)); // Primeros 80 chars
+      Serial.print("[GPS] Baudrate correcto: ");
+      Serial.println(baudrates[i]);
+      
+      // Reiniciar con el baudrate correcto
+      gpsSerial.end();
+      gpsSerial.begin(baudrates[i], SERIAL_8N1, GPS_RX, GPS_TX);
+      
+      if (oledWorking) {
+        showMessage("GPS OK", String(baudrates[i]) + " bps");
+        delay(1000);
+      }
+      return;
+    } else if (testData.length() > 0) {
+      Serial.print("[GPS] Datos incorrectos (");
+      Serial.print(testData.length());
+      Serial.println(" bytes)");
+      // Mostrar primeros bytes en hexadecimal
+      Serial.print("[GPS] Hex: ");
+      for (int j = 0; j < min(20, (int)testData.length()); j++) {
+        Serial.print(testData[j], HEX);
+        Serial.print(" ");
+      }
+      Serial.println();
+    } else {
+      Serial.println("[GPS] Sin datos");
+    }
+    
+    gpsSerial.end();
+    delay(100);
+  }
+  
+  // Si llegamos aquí, ningún baudrate funcionó
+  Serial.println("[GPS] ✗ No se detectó NMEA en ningún baudrate");
+  Serial.println("[GPS] Probando pines invertidos (RX<->TX)...");
+  
+  // Probar con pines invertidos
+  for (int i = 0; i < 5; i++) {
+    Serial.print("[GPS] Probando ");
+    Serial.print(baudrates[i]);
+    Serial.println(" bps (pines invertidos)...");
+    
+    // INVERTIR: TX del ESP32 -> TX del GPS, RX del ESP32 -> RX del GPS
+    gpsSerial.begin(baudrates[i], SERIAL_8N1, GPS_TX, GPS_RX);
+    delay(500);
+    
+    unsigned long start = millis();
+    bool foundNMEA = false;
+    String testData = "";
+    
+    while (millis() - start < 2000) {
+      while (gpsSerial.available()) {
+        char c = gpsSerial.read();
+        testData += c;
+        if (c == '$') foundNMEA = true;
+      }
+      if (foundNMEA) break;
+    }
+    
+    if (foundNMEA) {
+      Serial.println("[GPS] ✓ ¡NMEA detectado con pines invertidos!");
+      Serial.print("[GPS] Datos: ");
+      Serial.println(testData.substring(0, 80));
+      Serial.print("[GPS] Baudrate: ");
+      Serial.println(baudrates[i]);
+      Serial.println("[GPS] ⚠️ Conexión: RX(ESP)->TX(GPS), TX(ESP)->RX(GPS)");
+      
+      if (oledWorking) {
+        showMessage("GPS OK INV", String(baudrates[i]) + " bps");
+        delay(1000);
+      }
+      return;
+    }
+    
+    gpsSerial.end();
+    delay(100);
+  }
+  
+  // Si llegamos aquí, nada funcionó
+  Serial.println("[GPS] ✗✗✗ ERROR: No se pudo detectar GPS");
+  Serial.println("[GPS] Verifica:");
+  Serial.println("  1. VCC -> 3.3V o 5V");
+  Serial.println("  2. GND -> GND");
+  Serial.println("  3. TX(GPS) -> GPIO 2");
+  Serial.println("  4. RX(GPS) -> GPIO 1");
+  Serial.println("  5. LED del GPS parpadeando");
+  
+  if (oledWorking) {
+    showMessage("GPS ERROR", "Ver Serial");
+  }
+}
+
 void initLoRa() {
   Serial.println("[LoRa] Inicializando módulo SX1262...");
   
@@ -500,12 +724,15 @@ void setup() {
   
   Serial.println("\n========================================");
   Serial.println("  VEHICULO AUTONOMO - HELTEC V3");
-  Serial.println("  Recepción LoRa + Control L298N");
+  Serial.println("  LoRa + GPS + Motores L298N");
   Serial.println("========================================\n");
 
   // Inicializar subsistemas
   initOLED();
   delay(1000);
+  
+  initGPS();
+  delay(500);
   
   initMotors();
   delay(500);
@@ -513,7 +740,30 @@ void setup() {
   initLoRa();
   delay(500);
   
+  // Mostrar GPS mientras esperamos fix
+  Serial.println("\n[Sistema] Esperando GPS fix...");
+  Serial.println("[Sistema] El GPS puede tardar 1-10 minutos en obtener fix");
+  Serial.println("[Sistema] Coloca el módulo GPS cerca de una ventana");
+  showMessage("GPS", "Buscando sats...");
+  
+  // Esperar 30 segundos para que el GPS obtenga algunos satélites
+  Serial.println("[Sistema] Esperando 30 segundos para GPS...");
+  unsigned long gpsWaitStart = millis();
+  while (millis() - gpsWaitStart < 30000) {
+    updateGPS();
+    
+    // Actualizar display cada 2 segundos
+    static unsigned long lastUpdate = 0;
+    if (millis() - lastUpdate > 2000) {
+      displayGPS();
+      lastUpdate = millis();
+    }
+    
+    delay(100);
+  }
+  
   // Solicitar waypoints
+  Serial.println("\n[Sistema] Iniciando modo LoRa...");
   showMessage("LoRa", "Requesting...");
   delay(1000);
   requestWaypoints();
@@ -525,6 +775,9 @@ void setup() {
 // ========== LOOP ==========
 
 void loop() {
+  // Actualizar datos GPS continuamente
+  updateGPS();
+  
   // Procesar paquetes LoRa recibidos
   processLoRaPacket();
   
@@ -550,6 +803,13 @@ void loop() {
     }
   }
   
-  // Si la misión ha comenzado, mantener waypoints en pantalla
+  // Mostrar GPS en pantalla cada 2 segundos si la misión aún no ha comenzado
+  static unsigned long lastGPSDisplay = 0;
+  if (!missionStarted && millis() - lastGPSDisplay > 2000) {
+    displayGPS();
+    lastGPSDisplay = millis();
+  }
+  
+  // Si la misión ha comenzado, aquí irá la navegación GPS
   // No hacer nada más por ahora
 }
