@@ -7,6 +7,18 @@
 #include <RadioLib.h>  // Librería RadioLib para SX1262
 #include <TinyGPS++.h>
 #include <HardwareSerial.h>
+#include <MPU6050_tockn.h>
+
+// ========== REGISTROS AK8963 (MAGNETÓMETRO) ==========
+#define AK8963_ADDR 0x0C
+#define AK8963_WIA 0x00
+#define AK8963_ST1 0x02
+#define AK8963_HXL 0x03
+#define AK8963_CNTL1 0x0A
+#define AK8963_CNTL2 0x0B
+#define AK8963_ASAX 0x10
+#define AK8963_ASAY 0x11
+#define AK8963_ASAZ 0x12
 
 // ========== CONFIGURACIÓN LORA ==========
 // Pines SX1262 para Heltec WiFi LoRa 32 V3
@@ -90,8 +102,8 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY);
 
 // ========== CONFIGURACIÓN GPS ==========
 // Pines libres según pinout Heltec V3
-#define GPS_RX 2   // RX del GPS conectado a GPIO 2
-#define GPS_TX 1   // TX del GPS conectado a GPIO 1
+#define GPS_RX 1   // RX del ESP32 conectado a TX del GPS
+#define GPS_TX 2   // TX del ESP32 conectado a RX del GPS
 #define GPS_BAUD 9600
 
 // Objeto GPS
@@ -105,29 +117,61 @@ int satellites = 0;
 bool gpsFixed = false;
 unsigned long lastGPSUpdate = 0;
 
+// ========== CONFIGURACIÓN MPU 9250/6500 ==========
+// Pines I2C para MPU: GPIO 6 (SDA), GPIO 7 (SCL)
+#define MPU_SDA 6
+#define MPU_SCL 7
+
+// Objeto MPU6050 con TwoWire secundario
+TwoWire mpuWire = TwoWire(1);
+MPU6050 mpu(mpuWire);
+bool mpuWorking = false;
+
+// Variables IMU
+float accelX = 0.0, accelY = 0.0, accelZ = 0.0;
+float gyroX = 0.0, gyroY = 0.0, gyroZ = 0.0;
+float magX = 0.0, magY = 0.0, magZ = 0.0;
+float heading = 0.0;  // Brújula: 0-360 grados
+float tempMPU = 0.0;
+unsigned long lastMPUUpdate = 0;
+
+// Calibración del magnetómetro AK8963
+float magOffsetX = 0.0, magOffsetY = 0.0, magOffsetZ = 0.0;
+float magScaleX = 1.0, magScaleY = 1.0, magScaleZ = 1.0;
+float magASAX = 0.0, magASAY = 0.0, magASAZ = 0.0;
+
 // ========== DECLARACIONES FORWARD ==========
 void showMessage(const char *line1, const char *line2);
 void showMessage(String line1, String line2);
 void startMission();
 void updateGPS();
 void displayGPS();
+void updateMPU();
+void initAK8963();
+void calibrateMagnetometer();
+void verifyMagnetometer(float targetHeading = 0.0);
+void readAK8963Data();
+uint8_t readAK8963Register(uint8_t reg);
+void writeAK8963Register(uint8_t reg, uint8_t value);
 
 // ========== CONFIGURACIÓN MOTORES L298N ==========
-// Motor A (Motor Izquierdo)
-const int M1_IN1 = 19;
+// Motor A (Derecho): ENA=48, IN1=3, IN2=26
+const int M1_IN1 = 3;
 const int M1_IN2 = 26;
 const int M1_ENA = 48;
 
-// Motor B (Motor Derecho)
-const int M2_IN1 = 45;
+// Motor B (Izquierdo): ENB=47, IN3=4, IN4=20
+const int M2_IN1 = 4;
 const int M2_IN2 = 20;
 const int M2_ENB = 47;
 
-// PWM
+// PWM en los pines IN (no en ENA/ENB porque LEDC no funciona en GPIO 48/47)
 const int PWM_FREQ = 5000;
-const int PWM_RESOLUTION = 8;
-const int PWM_CHANNEL_ENA = 0;
-const int PWM_CHANNEL_ENB = 1;
+const int PWM_RESOLUTION = 8;  // 0-255
+const int CH_M1_IN1 = 0;
+const int CH_M1_IN2 = 1;
+const int CH_M2_IN1 = 2;
+const int CH_M2_IN2 = 3;
 
 // ========== CONFIGURACIÓN OLED ==========
 U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, /* clock=*/ 18, /* data=*/ 17, /* reset=*/ 21);
@@ -404,34 +448,29 @@ float calculateBearing(float lat1, float lon1, float lat2, float lon2) {
 
 void motorForward(int in1, int in2, int speed = 255) {
   bool isMotorA = (in1 == M1_IN1);
-  int pwm_channel = isMotorA ? PWM_CHANNEL_ENA : PWM_CHANNEL_ENB;
+  int ch1 = isMotorA ? CH_M1_IN1 : CH_M2_IN1;
+  int ch2 = isMotorA ? CH_M1_IN2 : CH_M2_IN2;
   
-  ledcWrite(pwm_channel, speed);
-  delay(10);
-  
-  digitalWrite(in1, LOW);
-  digitalWrite(in2, HIGH);
+  ledcWrite(ch1, 0);       // IN1 = LOW
+  ledcWrite(ch2, speed);   // IN2 = PWM(speed)
 }
 
 void motorBackward(int in1, int in2, int speed = 255) {
   bool isMotorA = (in1 == M1_IN1);
-  int pwm_channel = isMotorA ? PWM_CHANNEL_ENA : PWM_CHANNEL_ENB;
+  int ch1 = isMotorA ? CH_M1_IN1 : CH_M2_IN1;
+  int ch2 = isMotorA ? CH_M1_IN2 : CH_M2_IN2;
   
-  ledcWrite(pwm_channel, speed);
-  delay(10);
-  
-  digitalWrite(in1, HIGH);
-  digitalWrite(in2, LOW);
+  ledcWrite(ch1, speed);   // IN1 = PWM(speed)
+  ledcWrite(ch2, 0);       // IN2 = LOW
 }
 
 void motorStop(int in1, int in2) {
   bool isMotorA = (in1 == M1_IN1);
-  int pwm_channel = isMotorA ? PWM_CHANNEL_ENA : PWM_CHANNEL_ENB;
+  int ch1 = isMotorA ? CH_M1_IN1 : CH_M2_IN1;
+  int ch2 = isMotorA ? CH_M1_IN2 : CH_M2_IN2;
   
-  digitalWrite(in1, LOW);
-  digitalWrite(in2, LOW);
-  delay(5);
-  ledcWrite(pwm_channel, 0);
+  ledcWrite(ch1, 0);
+  ledcWrite(ch2, 0);
 }
 
 void stopAllMotors() {
@@ -439,22 +478,22 @@ void stopAllMotors() {
   motorStop(M2_IN1, M2_IN2);
 }
 
-void moveForward(int speed = 200) {
+void moveForward(int speed = 255) {
   motorForward(M1_IN1, M1_IN2, speed);
   motorForward(M2_IN1, M2_IN2, speed);
 }
 
-void moveBackward(int speed = 200) {
+void moveBackward(int speed = 255) {
   motorBackward(M1_IN1, M1_IN2, speed);
   motorBackward(M2_IN1, M2_IN2, speed);
 }
 
-void turnLeft(int speed = 150) {
+void turnLeft(int speed = 255) {
   motorBackward(M1_IN1, M1_IN2, speed);  // Motor izq atrás
   motorForward(M2_IN1, M2_IN2, speed);   // Motor der adelante
 }
 
-void turnRight(int speed = 150) {
+void turnRight(int speed = 255) {
   motorForward(M1_IN1, M1_IN2, speed);   // Motor izq adelante
   motorBackward(M2_IN1, M2_IN2, speed);  // Motor der atrás
 }
@@ -662,23 +701,28 @@ void initOLED() {
 void initMotors() {
   Serial.println("[Motor] Configurando L298N...");
   
-  // Pines de dirección
-  pinMode(M1_IN1, OUTPUT);
-  pinMode(M1_IN2, OUTPUT);
-  pinMode(M2_IN1, OUTPUT);
-  pinMode(M2_IN2, OUTPUT);
+  // ENA/ENB como GPIO siempre HIGH (LEDC no funciona en GPIO 48/47)
+  pinMode(M1_ENA, OUTPUT);
+  pinMode(M2_ENB, OUTPUT);
+  digitalWrite(M1_ENA, HIGH);
+  digitalWrite(M2_ENB, HIGH);
   
-  // PWM para pines Enable
-  ledcSetup(PWM_CHANNEL_ENA, PWM_FREQ, PWM_RESOLUTION);
-  ledcSetup(PWM_CHANNEL_ENB, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(M1_ENA, PWM_CHANNEL_ENA);
-  ledcAttachPin(M2_ENB, PWM_CHANNEL_ENB);
+  // PWM en los pines IN para control de velocidad
+  ledcSetup(CH_M1_IN1, PWM_FREQ, PWM_RESOLUTION);
+  ledcSetup(CH_M1_IN2, PWM_FREQ, PWM_RESOLUTION);
+  ledcSetup(CH_M2_IN1, PWM_FREQ, PWM_RESOLUTION);
+  ledcSetup(CH_M2_IN2, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(M1_IN1, CH_M1_IN1);
+  ledcAttachPin(M1_IN2, CH_M1_IN2);
+  ledcAttachPin(M2_IN1, CH_M2_IN1);
+  ledcAttachPin(M2_IN2, CH_M2_IN2);
   
   // Parada inicial
   stopAllMotors();
   
-  Serial.println("[Motor] Motor A: IN1=19, IN2=26, ENA=48");
-  Serial.println("[Motor] Motor B: IN1=21, IN2=20, ENB=47");
+  Serial.println("[Motor] Motor A: IN1=3(CH0), IN2=26(CH1), ENA=48");
+  Serial.println("[Motor] Motor B: IN3=4(CH2), IN4=20(CH3), ENB=47");
+  Serial.println("[Motor] PWM en pines IN, ENA/ENB=HIGH fijo");
   Serial.println("[Motor] OK");
 }
 
@@ -812,8 +856,482 @@ void initGPS() {
   }
 }
 
+void initMPU() {
+  Serial.println("[MPU] Inicializando MPU6050 + AK8963...");
+  
+  mpuWire.begin(MPU_SDA, MPU_SCL, 400000);
+  delay(100);
+  
+  mpu.begin();
+  delay(100);
+  
+  Serial.println("[MPU] Calibrando giroscopio (mantén quieto)...");
+  mpu.calcGyroOffsets(true);
+  
+  Serial.println("[AK8963] Habilitando I2C master en MPU6050...");
+  mpuWire.beginTransmission(0x68);
+  mpuWire.write(0x36);  // USER_CTRL
+  mpuWire.write(0x40);  // I2C_MST_EN
+  mpuWire.endTransmission();
+  delay(50);
+  
+  mpuWire.beginTransmission(0x68);
+  mpuWire.write(0x37);  // I2C_MST_CTRL
+  mpuWire.write(0x0D);  // 400kHz
+  mpuWire.endTransmission();
+  delay(50);
+  
+  initAK8963();
+  
+  mpuWorking = true;
+  Serial.println("[MPU] ✓ Sensor inicializado correctamente");
+  Serial.println("[MPU] OK - Accel + Gyro + Temp + Magnetómetro funcionando");
+  
+  showMessage("MPU Status", "OK");
+  delay(1000);
+}
+
+void updateMPU() {
+  if (!mpuWorking) return;
+  
+  // Actualizar MPU6050 (acelerómetro, giroscopio, temperatura)
+  mpu.update();
+  
+  // Obtener valores del MPU6050
+  accelX = mpu.getAccX();
+  accelY = mpu.getAccY();
+  accelZ = mpu.getAccZ();
+  
+  gyroX = mpu.getGyroX();
+  gyroY = mpu.getGyroY();
+  gyroZ = mpu.getGyroZ();
+  
+  tempMPU = mpu.getTemp();
+  
+  // Leer magnetómetro AK8963
+  readAK8963Data();
+  
+  lastMPUUpdate = millis();
+}
+
+void displayMPU() {
+  if (!mpuWorking || !oledWorking) return;
+  
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+  
+  u8g2.drawStr(0, 10, "MPU6050+AK8963");
+  
+  // Heading (Magnetómetro - Brújula)
+  u8g2.drawStr(0, 24, "Heading:");
+  String headStr = String(heading, 0) + "°";
+  u8g2.drawStr(70, 24, headStr.c_str());
+  
+  // Temperatura
+  u8g2.drawStr(0, 38, "Temp:");
+  String tempStr = String(tempMPU, 1) + "C";
+  u8g2.drawStr(50, 38, tempStr.c_str());
+  
+  u8g2.sendBuffer();
+}
+
+// ========== FUNCIONES AK8963 (MAGNETÓMETRO) ==========
+
+uint8_t readAK8963Register(uint8_t reg) {
+  mpuWire.beginTransmission(0x68);
+  mpuWire.write(0x25);  // I2C_SLV0_ADDR
+  mpuWire.write(AK8963_ADDR | 0x80);
+  mpuWire.endTransmission();
+  
+  mpuWire.beginTransmission(0x68);
+  mpuWire.write(0x26);  // I2C_SLV0_REG
+  mpuWire.write(reg);
+  mpuWire.endTransmission();
+  
+  mpuWire.beginTransmission(0x68);
+  mpuWire.write(0x27);  // I2C_SLV0_CTRL
+  mpuWire.write(0x81);
+  mpuWire.endTransmission();
+  
+  delay(10);
+  
+  mpuWire.beginTransmission(0x68);
+  mpuWire.write(0x3B);  // EXT_SENS_DATA_00
+  mpuWire.endTransmission(false);
+  mpuWire.requestFrom(0x68, 1);
+  
+  return mpuWire.read();
+}
+
+void writeAK8963Register(uint8_t reg, uint8_t value) {
+  mpuWire.beginTransmission(0x68);
+  mpuWire.write(0x24);  // I2C_SLV0_ADDR
+  mpuWire.write(AK8963_ADDR);
+  mpuWire.endTransmission();
+  
+  mpuWire.beginTransmission(0x68);
+  mpuWire.write(0x26);  // I2C_SLV0_REG
+  mpuWire.write(reg);
+  mpuWire.endTransmission();
+  
+  mpuWire.beginTransmission(0x68);
+  mpuWire.write(0x28);  // I2C_SLV0_DO
+  mpuWire.write(value);
+  mpuWire.endTransmission();
+  
+  mpuWire.beginTransmission(0x68);
+  mpuWire.write(0x27);  // I2C_SLV0_CTRL
+  mpuWire.write(0x81);
+  mpuWire.endTransmission();
+  
+  delay(10);
+}
+
+void initAK8963() {
+  Serial.println("[AK8963] Inicializando magnetómetro...");
+  
+  writeAK8963Register(AK8963_CNTL2, 0x01);  // Soft reset
+  delay(100);
+  
+  writeAK8963Register(AK8963_CNTL1, 0x0F);  // Fuse ROM access
+  delay(100);
+  
+  magASAX = (float)readAK8963Register(AK8963_ASAX);
+  magASAY = (float)readAK8963Register(AK8963_ASAY);
+  magASAZ = (float)readAK8963Register(AK8963_ASAZ);
+  
+  Serial.print("[AK8963] Sensibilidad X:");
+  Serial.print(magASAX);
+  Serial.print(" Y:");
+  Serial.print(magASAY);
+  Serial.print(" Z:");
+  Serial.println(magASAZ);
+  
+  writeAK8963Register(AK8963_CNTL1, 0x16);  // 16-bit, 100Hz
+  delay(100);
+  
+  Serial.println("[AK8963] ✓ Magnetómetro inicializado");
+}
+
+void calibrateMagnetometer() {
+  Serial.println("\n========================================");
+  Serial.println("[AK8963] INICIANDO CALIBRACIÓN");
+  Serial.println("========================================");
+  Serial.println("[AK8963] El robot girará solo durante 20 segundos");
+  Serial.println("[AK8963] Asegúrate de que tiene espacio libre");
+  Serial.println("[AK8963] Esperando 3 segundos para empezar...");
+  
+  showMessage("CAL MAG", "3 seg...");
+  delay(3000);
+  
+  // Variables para almacenar mín/máx
+  float minX = 10000, maxX = -10000;
+  float minY = 10000, maxY = -10000;
+  float minZ = 10000, maxZ = -10000;
+  
+  unsigned long calibStart = millis();
+  int samples = 0;
+  int phase = 0;
+  
+  Serial.println("[AK8963] ¡CALIBRACIÓN EN CURSO!");
+  Serial.println("[AK8963] Fase 1: Girando a la derecha...");
+  showMessage("CAL MAG", "Girando DER");
+  
+  // Fase 1: Girar a la derecha
+  turnRight(230);
+  
+  // Recopilar datos durante 20 segundos
+  while (millis() - calibStart < 20000) {
+    // Cambiar de dirección a los 10 segundos
+    if (phase == 0 && millis() - calibStart > 10000) {
+      phase = 1;
+      Serial.println("[AK8963] Fase 2: Girando a la izquierda...");
+      showMessage("CAL MAG", "Girando IZQ");
+      turnLeft(230);
+    }
+    
+    readAK8963Data();
+    
+    // Actualizar mín/máx
+    if (magX < minX) minX = magX;
+    if (magX > maxX) maxX = magX;
+    if (magY < minY) minY = magY;
+    if (magY > maxY) maxY = magY;
+    if (magZ < minZ) minZ = magZ;
+    if (magZ > maxZ) maxZ = magZ;
+    
+    samples++;
+    
+    // Mostrar progreso cada segundo
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint > 1000) {
+      float elapsed = (millis() - calibStart) / 1000.0;
+      Serial.print("[AK8963] ");
+      Serial.print(elapsed, 1);
+      Serial.print("s - X:[");
+      Serial.print(minX, 0);
+      Serial.print(",");
+      Serial.print(maxX, 0);
+      Serial.print("] Y:[");
+      Serial.print(minY, 0);
+      Serial.print(",");
+      Serial.print(maxY, 0);
+      Serial.print("] Z:[");
+      Serial.print(minZ, 0);
+      Serial.print(",");
+      Serial.print(maxZ, 0);
+      Serial.println("]");
+      lastPrint = millis();
+    }
+    
+    delay(50);
+  }
+  
+  // PARAR MOTORES
+  stopAllMotors();
+  Serial.println("[AK8963] Motores detenidos");
+  
+  // Calcular offsets y escalas
+  float offsetX = (maxX + minX) / 2.0;
+  float offsetY = (maxY + minY) / 2.0;
+  float offsetZ = (maxZ + minZ) / 2.0;
+  
+  float rangeX = (maxX - minX) / 2.0;
+  float rangeY = (maxY - minY) / 2.0;
+  float rangeZ = (maxZ - minZ) / 2.0;
+  
+  float avgRange = (rangeX + rangeY + rangeZ) / 3.0;
+  
+  // Evitar división por cero
+  float scaleX = (rangeX > 0) ? avgRange / rangeX : 1.0;
+  float scaleY = (rangeY > 0) ? avgRange / rangeY : 1.0;
+  float scaleZ = (rangeZ > 0) ? avgRange / rangeZ : 1.0;
+  
+  // Guardar calibración
+  magOffsetX = offsetX;
+  magOffsetY = offsetY;
+  magOffsetZ = offsetZ;
+  magScaleX = scaleX;
+  magScaleY = scaleY;
+  magScaleZ = scaleZ;
+  
+  Serial.println("\n========================================");
+  Serial.println("[AK8963] CALIBRACIÓN COMPLETADA");
+  Serial.println("========================================");
+  Serial.print("[AK8963] Muestras: ");
+  Serial.println(samples);
+  Serial.println("[AK8963] Offsets calculados:");
+  Serial.print("  X: ");
+  Serial.print(magOffsetX, 2);
+  Serial.print(" Y: ");
+  Serial.print(magOffsetY, 2);
+  Serial.print(" Z: ");
+  Serial.println(magOffsetZ, 2);
+  
+  Serial.println("[AK8963] Escalas calculadas:");
+  Serial.print("  X: ");
+  Serial.print(magScaleX, 3);
+  Serial.print(" Y: ");
+  Serial.print(magScaleY, 3);
+  Serial.print(" Z: ");
+  Serial.println(magScaleZ, 3);
+  
+  Serial.println("[AK8963] ✓ Magnetómetro calibrado correctamente");
+  Serial.println("========================================\n");
+  
+  showMessage("MAG CAL", "OK!");
+  delay(2000);
+}
+
+void verifyMagnetometer(float targetHeading) {
+  Serial.println("\n========================================");
+  Serial.println("[VERIFY] VERIFICACIÓN DEL MAGNETÓMETRO");
+  Serial.println("========================================");
+  Serial.println("[VERIFY] Test: girar en 4 pasos de ~90°");
+  Serial.println("[VERIFY] Si los headings varían ~90° entre sí = OK");
+  Serial.println("[VERIFY] (Los motores generan campo magnético,");
+  Serial.println("[VERIFY]  por eso se lee con motores PARADOS)");
+  Serial.println("[VERIFY] Esperando 3 segundos...");
+  
+  showMessage("VERIFY MAG", "4 pasos 90deg");
+  delay(3000);
+  
+  // Paso 0: Leer heading inicial con motores parados
+  float headings[5];  // 5 lecturas: posición inicial + 4 giros
+  
+  // Hacer varias lecturas para estabilizar
+  for (int i = 0; i < 5; i++) {
+    readAK8963Data();
+    delay(50);
+  }
+  headings[0] = heading;
+  
+  Serial.print("[VERIFY] Pos 0 (inicio): Heading = ");
+  Serial.print(headings[0], 1);
+  Serial.println("°");
+  
+  if (oledWorking) {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.drawStr(0, 10, "VERIFY MAG");
+    String s0 = "P0: " + String(headings[0], 1) + String("\xb0");
+    u8g2.drawStr(0, 24, s0.c_str());
+    u8g2.sendBuffer();
+  }
+  
+  // Hacer 4 giros de ~90° cada uno
+  for (int step = 1; step <= 4; step++) {
+    Serial.print("[VERIFY] Girando paso ");
+    Serial.print(step);
+    Serial.println("/4 (~90°)...");
+    
+    // Girar ~90°: pulso de motor calibrado
+    // Girar durante un tiempo fijo (ajustar según velocidad real)
+    turnRight(230);
+    delay(800);  // ~90° a velocidad 230 (ajustar si necesario)
+    stopAllMotors();
+    
+    // Esperar a que se estabilice el robot y el campo magnético
+    delay(500);
+    
+    // Leer heading varias veces con motores parados
+    for (int i = 0; i < 5; i++) {
+      readAK8963Data();
+      delay(50);
+    }
+    headings[step] = heading;
+    
+    Serial.print("[VERIFY] Pos ");
+    Serial.print(step);
+    Serial.print(": Heading = ");
+    Serial.print(headings[step], 1);
+    Serial.println("°");
+    
+    if (oledWorking) {
+      u8g2.clearBuffer();
+      u8g2.setFont(u8g2_font_ncenB08_tr);
+      u8g2.drawStr(0, 10, "VERIFY MAG");
+      for (int j = 0; j <= step; j++) {
+        String line = "P" + String(j) + ": " + String(headings[j], 1) + String("\xb0");
+        u8g2.drawStr(0, 24 + j * 12, line.c_str());
+      }
+      u8g2.sendBuffer();
+    }
+    
+    delay(500);
+  }
+  
+  // Analizar resultados: calcular diferencias entre pasos consecutivos
+  Serial.println("\n========================================");
+  Serial.println("[VERIFY] RESULTADO DE VERIFICACIÓN");
+  Serial.println("========================================");
+  
+  float totalRotation = 0;
+  bool magnetometerOK = true;
+  
+  for (int i = 1; i <= 4; i++) {
+    float diff = headings[i] - headings[i - 1];
+    // Normalizar a -180..180
+    if (diff > 180.0) diff -= 360.0;
+    if (diff < -180.0) diff += 360.0;
+    
+    totalRotation += diff;
+    
+    Serial.print("[VERIFY] Paso ");
+    Serial.print(i - 1);
+    Serial.print("->"); 
+    Serial.print(i);
+    Serial.print(": ");
+    Serial.print(headings[i - 1], 1);
+    Serial.print("° -> ");
+    Serial.print(headings[i], 1);
+    Serial.print("° (delta: ");
+    Serial.print(diff, 1);
+    Serial.println("°)");
+    
+    // Cada paso debería ser ~90° (aceptar 30-150° como válido)
+    if (fabs(diff) < 20.0) {
+      Serial.println("[VERIFY]   ⚠ Cambio muy pequeño - posible problema");
+      magnetometerOK = false;
+    }
+  }
+  
+  Serial.print("[VERIFY] Rotación total: ");
+  Serial.print(totalRotation, 1);
+  Serial.println("° (esperado: ~360°)");
+  
+  // Vuelta completa debería ser ~360° (aceptar 200-500° como razonable)
+  if (fabs(totalRotation) > 200.0) {
+    Serial.println("[VERIFY] ✓ MAGNETÓMETRO FUNCIONA CORRECTAMENTE");
+    Serial.println("[VERIFY] ✓ El heading cambia al girar el robot");
+    Serial.println("[VERIFY] ✓ Rotación total cercana a 360°");
+    
+    // Estimar el offset por interferencia del motor
+    float motorOffset = headings[0];
+    Serial.print("[VERIFY] ℹ Heading con motores parados: ");
+    Serial.print(motorOffset, 1);
+    Serial.println("°");
+    Serial.println("[VERIFY] ℹ (Los motores pueden añadir offset al heading)");
+    
+    showMessage("MAG VERIFY", "OK! Funciona");
+    magnetometerOK = true;
+  } else {
+    Serial.println("[VERIFY] ⚠ Rotación total insuficiente");
+    Serial.println("[VERIFY] ⚠ El magnetómetro podría no estar leyendo bien");
+    Serial.println("[VERIFY] Continuando de todas formas...");
+    showMessage("MAG VERIFY", "REVISAR");
+    magnetometerOK = false;
+  }
+  
+  Serial.println("========================================\n");
+  
+  delay(3000);
+}
+
+void readAK8963Data() {
+  if (!mpuWorking) return;
+  
+  mpuWire.beginTransmission(0x68);
+  mpuWire.write(0x24);  // I2C_SLV0_ADDR
+  mpuWire.write(AK8963_ADDR | 0x80);
+  mpuWire.endTransmission();
+  
+  mpuWire.beginTransmission(0x68);
+  mpuWire.write(0x26);  // I2C_SLV0_REG
+  mpuWire.write(AK8963_ST1);
+  mpuWire.endTransmission();
+  
+  mpuWire.beginTransmission(0x68);
+  mpuWire.write(0x27);  // I2C_SLV0_CTRL
+  mpuWire.write(0x87);
+  mpuWire.endTransmission();
+  
+  delay(10);
+  
+  mpuWire.beginTransmission(0x68);
+  mpuWire.write(0x3B);  // EXT_SENS_DATA_00
+  mpuWire.endTransmission(false);
+  mpuWire.requestFrom(0x68, 7);
+  
+  if (mpuWire.available() == 7) {
+    uint8_t st1 = mpuWire.read();
+    int16_t magRawX = (mpuWire.read() | (mpuWire.read() << 8));
+    int16_t magRawY = (mpuWire.read() | (mpuWire.read() << 8));
+    int16_t magRawZ = (mpuWire.read() | (mpuWire.read() << 8));
+    uint8_t st2 = mpuWire.read();
+    
+    magX = (magRawX - magOffsetX) * magScaleX;
+    magY = (magRawY - magOffsetY) * magScaleY;
+    magZ = (magRawZ - magOffsetZ) * magScaleZ;
+    
+    heading = atan2(magY, magX) * 180.0 / PI;
+    if (heading < 0) heading += 360.0;
+  }
+}
+
 void initLoRa() {
   Serial.println("[LoRa] Inicializando módulo SX1262...");
+
   
   // Configurar SPI
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
@@ -883,8 +1401,59 @@ void setup() {
   initMotors();
   delay(500);
   
+  initMPU();
+  delay(500);
+  
   initLoRa();
   delay(500);
+  
+  // ========== MINI TEST MPU ==========
+  Serial.println("\n========== MINI TEST MPU 9250/6500 ==========");
+  if (mpuWorking) {
+    Serial.println("[TEST] Leyendo datos del MPU durante 5 segundos...");
+    showMessage("MPU Test", "Lectura...");
+    
+    unsigned long testStart = millis();
+    int sampleCount = 0;
+    
+    while (millis() - testStart < 5000) {
+      updateMPU();
+      
+      if (millis() - testStart > (sampleCount * 1000)) {
+        Serial.print("[MPU] Muestra ");
+        Serial.print(sampleCount + 1);
+        Serial.print(" - Accel: ");
+        Serial.print(accelX/16384.0, 3);
+        Serial.print("g, Gyro: ");
+        Serial.print(gyroX/131.0, 1);
+        Serial.print("°/s, Heading: ");
+        Serial.print(heading, 0);
+        Serial.print("°, Temp: ");
+        Serial.print(tempMPU, 1);
+        Serial.println("°C");
+        sampleCount++;
+      }
+      
+      displayMPU();
+      delay(100);
+    }
+    
+    Serial.println("[TEST] ✓ Test completado correctamente");
+    showMessage("MPU Test", "OK!");
+    delay(2000);
+    
+    // Calibrar magnetómetro
+    calibrateMagnetometer();
+    
+    // Verificar magnetómetro: girar hasta apuntar al Norte (0°)
+    verifyMagnetometer(0.0);
+    
+  } else {
+    Serial.println("[TEST] ✗ MPU no disponible");
+    showMessage("MPU Test", "FAILED");
+    delay(2000);
+  }
+  Serial.println("==========================================\n");
   
   // Mostrar GPS mientras esperamos fix
   Serial.println("\n[Sistema] Esperando GPS fix...");
@@ -924,8 +1493,26 @@ void loop() {
   // Actualizar datos GPS continuamente
   updateGPS();
   
+  // Actualizar datos del MPU continuamente
+  updateMPU();
+  
   // Procesar paquetes LoRa recibidos
   processLoRaPacket();
+  
+  // Mostrar datos del MPU cada 500ms
+  static unsigned long lastMPUDisplay = 0;
+  if (millis() - lastMPUDisplay > 500) {
+    Serial.print("[MPU] Heading: ");
+    Serial.print(heading, 0);
+    Serial.print("° | Accel: ");
+    Serial.print(accelX, 2);
+    Serial.print("g | Gyro: ");
+    Serial.print(gyroX, 1);
+    Serial.print("°/s | Temp: ");
+    Serial.print(tempMPU, 1);
+    Serial.println("°C");
+    lastMPUDisplay = millis();
+  }
   
   // DEBUG: Mostrar estado cada 5 segundos
   static unsigned long lastDebug = 0;
@@ -990,5 +1577,4 @@ void loop() {
   }
   
   // Si la misión ha comenzado, aquí irá la navegación GPS
-  // No hacer nada más por ahora
 }

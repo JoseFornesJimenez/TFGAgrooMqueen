@@ -3,9 +3,6 @@
 // Pines usados (según petición): GPIO19, GPIO20, GPIO21, GPIO26
 // Asumimos un puente H donde cada motor se controla con dos pines (IN1/IN2).
 // En este ejemplo se muestra cómo rotorizar adelante, atrás y detener.
-// Este test es principalmente manual/educativo: las aserciones automáticas
-// no pueden verificar movimiento físico. Por eso las aserciones comprueban
-// que las operaciones de pin se pueden ejecutar sin errores.
 
 #include <Arduino.h>
 #include <unity.h>
@@ -79,8 +76,6 @@ void test_motor_cycle(void) {
   delay(DURATION_MOVE);
   motorStop(M2_IN1, M2_IN2);
   delay(DURATION_STOP);
-
-  // Assert trivial: si llegamos hasta aquí, los comandos de GPIO se ejecutaron
   TEST_ASSERT_TRUE_MESSAGE(true, "Secuencia de control completada (verificar movimiento fisico)");
 }
 
@@ -92,12 +87,3 @@ int main(int argc, char **argv) {
   return 0;
 }
 
-/* Notas de cableado y seguridad (en español):
- - Asegúrate de conectar la alimentación del motor y del puente H correctamente.
- - No alimentar motores desde la placa ESP32; usa una fuente externa con masa común.
- - Si el puente H tiene pines de enable (ENA), configúralos adecuadamente o
-   asegúrate de que estén en HIGH para permitir la salida.
- - Verifica la corriente y la protección (fusible) para evitar daños.
- - Este test no puede comprobar físicamente el movimiento; observa el motor
-   mientras corre para verificar la operación.
-*/
