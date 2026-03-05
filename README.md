@@ -1,6 +1,6 @@
-﻿## 🚜 AgroMqueen — Vehículo Autónomo de Navegación GPS
+## 🚜 AgroMqueen — Vehículo Autónomo de Navegación GPS
 
-Robot autónomo basado en **Heltec WiFi LoRa 32 V3** (ESP32-S3) que recibe waypoints por LoRa desde una estación base, navega de forma autónoma usando GPS + brújula magnética (IMU), y envía telemetría en tiempo real.
+Robot autónomo basado en **Heltec WiFi LoRa 32 V3** (ESP32-S3) que recibe waypoints por LoRa desde una estación base, navega de forma autónoma usando GPS + magnetómetro HMC5883L + giroscopio MPU-6500, y envía telemetría en tiempo real.
 
 > **Repositorio:** [https://git.pandauniverse.es/panda/AgroMqueen](https://git.pandauniverse.es/panda/AgroMqueen)
 
@@ -15,7 +15,9 @@ Robot autónomo basado en **Heltec WiFi LoRa 32 V3** (ESP32-S3) que recibe waypo
 - [Protocolo LoRa](#-protocolo-lora)
 - [Secuencia de Arranque](#-secuencia-de-arranque)
 - [Calibración del Magnetómetro](#-calibración-del-magnetómetro)
-- [Control de Motores](#-control-de-motores)
+- [Control de Motores y PID](#-control-de-motores-y-pid)
+- [Navegación GPS](#-navegación-gps)
+- [WiFi Telnet](#-wifi-telnet)
 - [Dependencias](#-dependencias)
 - [Compilar y Subir](#-compilar-y-subir)
 - [Notas Técnicas](#-notas-técnicas)
@@ -39,11 +41,11 @@ Estación Base                          Vehículo
      │  ◄── REQUEST_WAYPOINTS (0x01) ──── │  (el vehículo solicita los waypoints)
      │                                     │
      │ ── START_TRANSMISSION (0x05) ────► │  (la estación anuncia cuántos waypoints)
-     │ ── WAYPOINT_DATA (0x02) ─────────► │  
+     │ ── WAYPOINT_DATA (0x02) ─────────► │
      │  ◄── ACK (0x04) ────────────────── │  (el vehículo confirma cada waypoint)
-     │ ── WAYPOINT_DATA (0x02) ─────────► │  
-     │  ◄── ACK (0x04) ────────────────── │  
-     │ ── END_TRANSMISSION (0x03) ──────► │  
+     │ ── WAYPOINT_DATA (0x02) ─────────► │
+     │  ◄── ACK (0x04) ────────────────── │
+     │ ── END_TRANSMISSION (0x03) ──────► │
      │                                     │
      │  ◄── TELEMETRY (0x06) ──────────── │  (cada 2s con GPS fix)
 ```
@@ -56,7 +58,8 @@ Estación Base                          Vehículo
 |---|---|---|
 | MCU | Heltec WiFi LoRa 32 V3 (ESP32-S3) | Controlador principal + LoRa SX1262 |
 | GPS | NEO-6M | Posicionamiento por satélite |
-| IMU | MPU-9250 / MPU-6500 | Acelerómetro + Giroscopio + Magnetómetro (AK8963) |
+| Magnetómetro | HMC5883L | Brújula magnética (I2C directo, 0x1E) |
+| IMU | MPU-6500 | Giroscopio Z para fusión complementaria (0x68) |
 | Motor Driver | L298N | Control de 2 motores DC |
 | Pantalla | OLED SSD1306 128×64 | Información en tiempo real |
 | Motores | 2× DC con reductora | Tracción diferencial |
@@ -78,16 +81,16 @@ Estación Base                          Vehículo
 |---|---|---|
 | RX (ESP ← GPS TX) | 1 | |
 | TX (ESP → GPS RX) | 2 | |
-| Baudrate | 9600 | Auto-detección en el arranque |
+| Baudrate | Auto-detect | Prueba 9600, 4800, 38400, 57600, 115200 |
 
-### MPU-9250 / MPU-6500 (I2C Secundario — TwoWire 1)
+### HMC5883L + MPU-6500 (I2C Hardware — Wire)
 | Señal | GPIO | Nota |
 |---|---|---|
 | SDA | 6 | |
 | SCL | 7 | |
 | Frecuencia | 400 kHz | |
-| Dirección | 0x68 | MPU6050 (accel+gyro) |
-| Dirección | 0x0C | AK8963 (magnetómetro, vía I2C master del MPU) |
+| HMC5883L addr | 0x1E | Magnetómetro |
+| MPU-6500 addr | 0x68 | Giroscopio Z (WHO_AM_I=0x70) |
 
 ### LoRa SX1262 (SPI — integrado en la placa)
 | Señal | GPIO |
@@ -121,23 +124,31 @@ Estación Base                          Vehículo
 ```
 placeholder.cpp
 ├── Inicialización (setup)
-│   ├── initOLED()          → Pantalla OLED por Software I2C
-│   ├── initGPS()           → Auto-detección de baudrate del GPS
-│   ├── initMotors()        → LEDC PWM en pines IN, ENA/ENB = HIGH
-│   ├── initMPU()           → MPU6050 + AK8963 por I2C master
-│   ├── initLoRa()          → SX1262 a 868 MHz
-│   ├── Test MPU (5s)       → Verifica accel/gyro/heading
-│   ├── calibrateMagnetometer() → Gira 20s recogiendo min/max
-│   ├── verifyMagnetometer()    → Gira 4×90° y verifica cambios
-│   ├── Espera GPS (30s)
-│   └── requestWaypoints()  → Solicita waypoints por LoRa
+│   ├── oledInit()              → Pantalla OLED por Software I2C
+│   ├── WiFi AP + Telnet        → AP "AgroMqueen" / telnet 192.168.4.1:23
+│   ├── gpsAutoDetect()         → Auto-detección de baudrate del GPS
+│   ├── motorsInit()            → LEDC PWM en pines IN, ENA/ENB = HIGH
+│   ├── hmcInit()               → HMC5883L por I2C hardware (400 kHz)
+│   ├── mpuInit()               → MPU-6500 por I2C, calibra bias giroscopio
+│   ├── loraInit()              → SX1262 a 868 MHz, CRC deshabilitado
+│   ├── Test HMC (8s)           → Muestra valores raw para verificar cableado
+│   ├── hmcLoadCalibration()    → Carga cal. desde flash NVS; si no hay, calibra a mano
+│   ├── detectAndSaveTurnSign() → Detecta si turnRight sube o baja el heading
+│   ├── faceNorth()             → Verifica magnetómetro orientando al Norte
+│   ├── Espera GPS (60s)
+│   └── requestWaypoints()      → Solicita waypoints por LoRa, activa navegación
 │
 ├── Bucle principal (loop)
-│   ├── updateGPS()         → Lee tramas NMEA del GPS
-│   ├── updateMPU()         → Lee accel, gyro, magnetómetro
-│   ├── processLoRaPacket() → Procesa waypoints y envía ACK
-│   ├── sendTelemetry()     → Envía posición/estado cada 2s
-│   └── [Navegación GPS]    → TODO: pendiente de implementar
+│   ├── telnetHandle()          → Acepta/lee conexiones WiFi Telnet
+│   ├── GPS feed                → Lee tramas NMEA del GPS
+│   ├── navigate()              → Navegación GPS activa hacia waypoints
+│   ├── Auto-retry waypoints    → Cada 60s si no hay ruta activa
+│   └── sendTelemetry()         → Envía posición/estado cada 2s
+│
+└── Funciones de movimiento
+    ├── driveStraight()         → Avance recto con PID (fusión gyro+HMC)
+    ├── returnToOrigin()        → Avanza, gira 180°, vuelve al origen por GPS
+    └── faceNorth()             → Orienta al Norte con control proporcional
 ```
 
 ---
@@ -151,7 +162,7 @@ placeholder.cpp
 | Ancho de Banda | 125 kHz |
 | Spreading Factor | 7 |
 | Potencia TX | 14 dBm |
-| CRC | Habilitado |
+| CRC hardware | Deshabilitado (checksum propio en protocolo) |
 
 ### Tipos de Mensaje
 | Código | Nombre | Dirección | Descripción |
@@ -198,36 +209,49 @@ struct __attribute__((packed)) TelemetryPacket {
 ## 🚀 Secuencia de Arranque
 
 1. **OLED** — Inicializa pantalla, muestra "VEHICULO AUTONOMO"
-2. **GPS** — Prueba baudrates (4800, 9600, 38400, 57600, 115200) en ambas polaridades
-3. **Motores** — Configura LEDC PWM en pines IN, ENA/ENB como GPIO HIGH
-4. **MPU** — Inicializa MPU6050, calibra giroscopio, habilita I2C master, configura AK8963
-5. **LoRa** — Inicializa SX1262 a 868 MHz
-6. **Test MPU** — Lee sensores durante 5 segundos
-7. **Calibración magnetómetro** — Gira el robot 20s (10s derecha + 10s izquierda) para calcular offsets
-8. **Verificación magnetómetro** — Gira 4×90° y verifica que el heading cambia
-9. **Espera GPS** — 30 segundos para adquisición de satélites
-10. **Solicitar waypoints** — Entra en modo recepción LoRa
+2. **WiFi AP** — Crea AP "AgroMqueen" (pass: agro1234), inicia servidor Telnet en puerto 23
+3. **GPS** — Auto-detección de baudrate (9600, 4800, 38400, 57600, 115200)
+4. **Motores** — Configura LEDC PWM en pines IN, ENA/ENB como GPIO HIGH
+5. **HMC5883L** — Inicializa magnetómetro por I2C (verifica ID 'H','4','3')
+6. **MPU-6500** — Inicializa giroscopio, calibra bias Z con 500 muestras en reposo
+7. **LoRa** — Inicializa SX1262 a 868 MHz, SF7, 125 kHz, CRC deshabilitado
+8. **Test HMC (8s)** — Muestra valores crudos en Serial/Telnet para verificar
+9. **Calibración HMC** — Carga desde flash NVS; si no hay datos guardados, calibra a mano (20s)
+10. **DetectTurnSign** — Gira brevemente para detectar si turnRight sube o baja el heading
+11. **faceNorth** — Orienta el robot al Norte para verificar el magnetómetro
+12. **Espera GPS** — Hasta 60 segundos para adquisición de satélites
+13. **Solicitar waypoints** — Pide waypoints por LoRa; si recibe, activa navegación
 
 ---
 
 ## 🧭 Calibración del Magnetómetro
 
-El AK8963 está dentro del MPU-9250 y se accede a través del **I2C master interno** del MPU6050 (registros 0x24-0x28, 0x36-0x37). No se puede acceder directamente por el bus I2C externo.
+El HMC5883L se conecta directamente al bus I2C hardware (GPIO 6/7, dirección 0x1E). La calibración se realiza **manualmente, con motores parados**, para evitar interferencias electromagnéticas.
 
-### Proceso de calibración
-1. El robot **gira a la derecha** durante 10 segundos a velocidad 230
-2. El robot **gira a la izquierda** durante 10 segundos a velocidad 230
-3. Se recogen valores min/max de magX, magY, magZ
-4. Se calculan **offsets** (centro de la esfera) y **escalas** (normalización)
+### Proceso de calibración (manual, sin motores)
+1. La pantalla OLED muestra "CALIBRA HMC — GIRA A MANO — 20 segundos..."
+2. El operario **gira el robot a mano** describiendo varios giros de 360° durante 20s
+3. Se recogen valores min/max de magX y magY
+4. Se calculan **offsets** (centro de la elipse) y **escalas** (normalización esférica)
+5. Los valores se **guardan en flash NVS** (Preferences) para no recalibrar en cada arranque
 
-### Verificación
-Después de calibrar, el robot gira 4 veces ~90° y lee el heading con motores parados en cada posición. Si los headings varían significativamente (rotación total > 200°), el magnetómetro funciona correctamente.
+### Configuración del sensor
+- 8 muestras promedio, 75 Hz, modo continuo
+- Ganancia: ±1.3 Gauss (1090 LSB/G)
+- Remapeo físico: sensor_X apunta izquierda, sensor_Y apunta atrás
 
-> ⚠️ Los motores y el L298N generan un campo magnético que puede afectar las lecturas. La calibración se hace con motores activos y la verificación con motores parados.
+### Fusión complementaria (en driveStraight)
+```
+fusedAngle = α × (fusedAngle + gyroZ × dt) + (1-α) × hmcDelta
+```
+- α = 0.20 (20% giroscopio, 80% magnetómetro)
+- GYRO_CLAMP = 8°/s (descarta picos de vibración de motores)
+
+> ⚠️ La calibración se guarda en NVS. Al arrancar, si hay calibración guardada se carga automáticamente y no es necesario repetirla.
 
 ---
 
-## ⚙️ Control de Motores
+## ⚙️ Control de Motores y PID
 
 ### Enfoque PWM
 El ESP32-S3 no permite usar LEDC PWM en los **GPIO 48 y 47** (ENA/ENB del L298N). La solución:
@@ -241,9 +265,80 @@ El ESP32-S3 no permite usar LEDC PWM en los **GPIO 48 y 47** (ENA/ENB del L298N)
 | `moveBackward(speed)` | Atrás | Atrás |
 | `turnRight(speed)` | Adelante | Atrás |
 | `turnLeft(speed)` | Atrás | Adelante |
-| `stopAllMotors()` | Parado | Parado |
+| `motorsStop()` | Parado | Parado |
 
-Velocidad por defecto: **255** (máxima).
+### driveStraight — Avance recto con PID de fusión
+
+```
+PID: error = desviación acumulada respecto al heading inicial
+     corrección = Kp*err + Ki*integral + Kd*derivada
+     Motor A (derecho) = baseSpd - corrección
+     Motor B (izquierdo) = baseSpd + corrección
+```
+
+| Parámetro | Valor | Nota |
+|---|---|---|
+| Kp | 2.5 | Proporcional |
+| Ki | 0.05 | Integral |
+| Kd | 0.0 | Derivativo |
+| MAX_CORRECTION | 40 | Límite de corrección PWM |
+| DEAD_BAND | 2° | Sin corrección dentro de este rango |
+| SPEED_MS_PER_M | 2500 ms/m | Ajustar según medición real a PWM=200 |
+
+### returnToOrigin — Prueba de retorno automático
+1. Guarda posición GPS actual como origen
+2. Avanza con `driveStraight()` el tiempo indicado
+3. Gira 180° usando el magnetómetro
+4. Navega de vuelta al origen guiado por GPS
+
+---
+
+## 🗺 Navegación GPS
+
+La función `navigate()` se ejecuta en el loop principal y gestiona la ruta completa:
+
+| Parámetro | Valor |
+|---|---|
+| WAYPOINT_REACH_M | 2.0 m — radio para considerar waypoint alcanzado |
+| BASE_SPEED | 200 PWM — velocidad normal |
+| TURN_SPEED | 160 PWM — velocidad al girar |
+| HEADING_TOL_DEG | ±15° — tolerancia de rumbo para avanzar recto |
+
+**Lógica de navegación:**
+- Si la distancia al waypoint < 2 m → avanza al siguiente WP
+- Si el error de rumbo > 15° → gira (derecha o izquierda según gTurnSign)
+- Si el error de rumbo ≤ 15° → avanza; reduce velocidad a 120 si dist < 3 m
+- Al completar todos los WPs → para motores y muestra "RUTA COMPLETADA"
+
+---
+
+## 📶 WiFi Telnet
+
+El vehículo crea un punto de acceso WiFi para depuración inalámbrica:
+
+| Parámetro | Valor |
+|---|---|
+| SSID | AgroMqueen |
+| Contraseña | agro1234 |
+| IP | 192.168.4.1 |
+| Puerto Telnet | 23 |
+
+Conectar con: `telnet 192.168.4.1` (PuTTY, Windows telnet, o `nc`)
+
+Al conectar se vuelca automáticamente el **buffer de arranque** (últimos 2 KB de log).
+
+### Comandos disponibles por Telnet
+
+| Comando | Función |
+|---|---|
+| `navegar` | Pide waypoints al base station y arranca la navegación |
+| `wp` | Lista los waypoints almacenados |
+| `saltar` | Salta al siguiente waypoint |
+| `calibrar` | Recalibra el magnetómetro HMC5883L (manual, 20s) |
+| `retorno` | Prueba: avanza 8s y vuelve al origen por GPS |
+| `estado` | Muestra heading, GPS fix y estado de navegación |
+| `parar` | Para motores y desactiva la navegación |
+| `ayuda` | Muestra lista de comandos |
 
 ---
 
@@ -256,11 +351,10 @@ Definidas en `platformio.ini`:
 platform = espressif32
 board = heltec_wifi_lora_32_V3
 framework = arduino
-lib_deps = 
+lib_deps =
     olikraus/U8g2@^2.34.14
     jgromes/RadioLib@^6.6.0
     mikalhart/TinyGPSPlus@^1.0.3
-    tockn/MPU6050_tockn@^1.5.2
 ```
 
 | Librería | Uso |
@@ -268,9 +362,8 @@ lib_deps =
 | **U8g2** | Pantalla OLED SSD1306 por Software I2C |
 | **RadioLib** | Módulo LoRa SX1262 (Heltec V3) |
 | **TinyGPS++** | Parsing de tramas NMEA del GPS |
-| **MPU6050_tockn** | Lectura de acelerómetro, giroscopio y temperatura |
 
-> El magnetómetro AK8963 se controla manualmente a través de registros I2C (no necesita librería adicional).
+> El magnetómetro HMC5883L y el giroscopio MPU-6500 se controlan directamente mediante registros I2C (sin librería externa).
 
 ---
 
@@ -285,6 +378,9 @@ pio run --target upload --upload-port COM20
 
 # Monitor serial
 pio device monitor --port COM20 --baud 115200
+
+# También puedes monitorear por WiFi:
+# telnet 192.168.4.1
 ```
 
 ---
@@ -304,12 +400,20 @@ ledcAttachPin(pin, channel);
 ledcWrite(channel, duty);
 ```
 
-### Acceso al magnetómetro AK8963
-Se accede a través del **I2C master del MPU6050**, no directamente por el bus I2C:
-- **Lectura**: Configura SLV0_ADDR con bit de lectura (0x80) → SLV0_REG → SLV0_CTRL → Lee EXT_SENS_DATA
-- **Escritura**: Configura SLV0_ADDR sin bit de lectura → SLV0_REG → SLV0_DO → SLV0_CTRL
+### Acceso al HMC5883L
+El HMC5883L se lee directamente por I2C hardware. Los datos llegan en orden **X, Z, Y** (¡Z antes que Y!):
+- Registros 0x03-0x04: X_MSB, X_LSB
+- Registros 0x05-0x06: Z_MSB, Z_LSB ← Z primero
+- Registros 0x07-0x08: Y_MSB, Y_LSB
+
+### Remapeo físico del HMC5883L
+Con la orientación actual del sensor en el robot:
+- Norte (frente) = `-sensor_Y`
+- Este (derecha) = `-sensor_X`
 
 ### Telemetría
-- Se envía cada **2 segundos** cuando hay GPS fix
-- Se **pausa automáticamente** durante la recepción de waypoints para evitar colisiones LoRa
-- Incluye: posición, satélites, waypoint actual, distancia, rumbo, RSSI, SNR, batería
+- Se envía cada **2 segundos** siempre (con o sin GPS fix)
+- Incluye: posición, satélites, waypoint actual, distancia, rumbo, RSSI, SNR, batería (fijo al 100% — TODO)
+
+### detectAndSaveTurnSign
+Al arrancar, el robot gira brevemente a la derecha y mide el cambio de heading para determinar si `turnRight()` aumenta (+1) o disminuye (-1) el heading. Este signo se usa en toda la lógica de navegación y corrección PID.

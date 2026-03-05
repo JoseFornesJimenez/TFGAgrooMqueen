@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmd.exe /c \"C:\\\\Users\\\\leftg\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe run -d C:\\\\Users\\\\leftg\\\\Documents\\\\PlatformIO\\\\Projects\\\\Estacion 2>&1\")",
+      "Bash(cmd.exe /c \"C:\\\\Users\\\\leftg\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe run -d C:\\\\Users\\\\leftg\\\\Documents\\\\PlatformIO\\\\Projects\\\\TFG 2>&1\")"
+    ]
+  }
+}
