@@ -1590,7 +1590,7 @@ static bool processTelnetCmd(const char *cmd) {
         wlogf("[CMD] Iniciando prueba de retorno al origen...\r\n");
         returnToOrigin(8000, 200);
         wlogf("[CMD] Retorno completado\r\n");
-
+//hola
     } else if (strcmp(cmd, "gps") == 0) {
         // Debug GPS: muestra cuántos chars/sentencias ha procesado TinyGPS++
         // y vuelca 3 segundos de datos crudos del serial del GPS
