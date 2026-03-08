@@ -1034,9 +1034,13 @@ void gpsAutoDetect() {
         delay(300);
         unsigned long t0 = millis();
         while (millis() - t0 < 600) {
-            if (gpsSerial.available() && gpsSerial.read() == '$') {
-                wlogf("[GPS] Detectado a %lu bps\n", (unsigned long)baud);
-                return;
+            if (gpsSerial.available()) {
+                char c = (char)gpsSerial.read();
+                gps.encode(c);
+                if (c == '$') {
+                    wlogf("[GPS] Detectado a %lu bps\n", (unsigned long)baud);
+                    return;
+                }
             }
         }
         gpsSerial.end();
@@ -1102,6 +1106,7 @@ static int loraReceive(uint8_t *buf, size_t maxLen, uint32_t timeoutMs) {
     unsigned long t0 = millis();
     while (millis() - t0 < timeoutMs) {
         telnetHandle();
+        while (gpsSerial.available()) gps.encode(gpsSerial.read());
         if (digitalRead(PIN_LORA_DIO1) == HIGH || radio.available()) {
             size_t pktLen = radio.getPacketLength();
             if (pktLen == 0) pktLen = maxLen;
@@ -1625,6 +1630,12 @@ void loop() {
             wpRequested = false;
         }
     }
+
+    // ── GPS — alimentar el parser ──
+    while (gpsSerial.available()) gps.encode(gpsSerial.read());
+
+    // ── Navegación ──
+    if (navActive) navigate();
 
     // ── OLED cada 500 ms ──
     static unsigned long lastOled = 0;
