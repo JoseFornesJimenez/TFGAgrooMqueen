@@ -1532,6 +1532,7 @@ static bool processTelnetCmd(const char *cmd) {
         wlogf("  saltar    — salta al siguiente waypoint\r\n");
         wlogf("  calibrar  — recalibrar magnetometro HMC5883L\r\n");
         wlogf("  retorno   — prueba: avanza 8s y vuelve al origen por GPS\r\n");
+        wlogf("  gps       — debug GPS: chars, sentencias, volcado 3s crudo\r\n");
         wlogf("  estado    — muestra GPS, heading y estado actual\r\n");
         wlogf("  parar     — para motores y desactiva navegacion\r\n");
 
@@ -1590,10 +1591,38 @@ static bool processTelnetCmd(const char *cmd) {
         returnToOrigin(8000, 200);
         wlogf("[CMD] Retorno completado\r\n");
 
+    } else if (strcmp(cmd, "gps") == 0) {
+        // Debug GPS: muestra cuántos chars/sentencias ha procesado TinyGPS++
+        // y vuelca 3 segundos de datos crudos del serial del GPS
+        wlogf("[GPS] chars=%lu sentencias=%lu fallidas=%lu\r\n",
+              (unsigned long)gps.charsProcessed(),
+              (unsigned long)gps.sentencesWithFix(),
+              (unsigned long)gps.failedChecksum());
+        wlogf("[GPS] fix=%s  sats=%u  age=%lums\r\n",
+              gps.location.isValid() ? "SI" : "NO",
+              gps.satellites.isValid() ? gps.satellites.value() : 0,
+              (unsigned long)gps.location.age());
+        wlogf("[GPS] Volcando 3s de datos crudos GPS:\r\n");
+        unsigned long tDump = millis();
+        while (millis() - tDump < 3000) {
+            while (gpsSerial.available()) {
+                char c = (char)gpsSerial.read();
+                gps.encode(c);
+                telnetClient.write((uint8_t)c);
+            }
+        }
+        wlogf("\r\n[GPS] Fin volcado\r\n");
+
     } else if (strcmp(cmd, "estado") == 0) {
         float h = hmcHeadingInstant(6);
         wlogf("[EST] Heading: %.1f deg\r\n", h);
-        wlogf("[EST] GPS fix: %s\r\n", gps.location.isValid() ? "SI" : "NO");
+        wlogf("[EST] GPS fix: %s  sats=%u  age=%lums\r\n",
+              gps.location.isValid() ? "SI" : "NO",
+              gps.satellites.isValid() ? gps.satellites.value() : 0,
+              (unsigned long)gps.location.age());
+        wlogf("[EST] chars=%lu sentencias=%lu\r\n",
+              (unsigned long)gps.charsProcessed(),
+              (unsigned long)gps.sentencesWithFix());
         if (gps.location.isValid()) {
             wlogf("[EST] Pos: %.6f, %.6f  sats=%u\r\n",
                   gps.location.lat(), gps.location.lng(),
