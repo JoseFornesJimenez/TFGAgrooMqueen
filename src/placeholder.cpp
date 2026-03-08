@@ -541,28 +541,43 @@ float hmcHeadingInstant(uint8_t n = 6) {
 void detectAndSaveTurnSign() {
     // Precalentar filtro con 10 lecturas
     for (int i = 0; i < 10; i++) { hmcHeading(); delay(15); }
-    float h0 = hmcHeadingInstant(12);  // 12 muestras para mejor precisión
-    wlogf("[HMC] TurnSign h0=%.1f — girando derecha 600ms...\n", h0);
-    turnRight(180);
-    delay(600);   // más tiempo = delta más grande y más fiable
-    motorsStop();
-    delay(1200);  // más settle time antes de medir
-    // Volver a calentar el filtro
-    for (int i = 0; i < 8; i++) { hmcHeading(); delay(15); }
-    float h1 = hmcHeadingInstant(12);
-    float delta = h1 - h0;
-    if (delta >  180.0f) delta -= 360.0f;
-    if (delta < -180.0f) delta += 360.0f;
+
+    uint8_t spd = 180;
+    float delta = 0.0f;
+
+    // Reintentar con más fuerza si el robot no se mueve
+    for (int attempt = 0; attempt < 4; attempt++) {
+        float h0 = hmcHeadingInstant(12);
+        wlogf("[HMC] TurnSign intento %d — SPD=%u h0=%.1f\n", attempt + 1, spd, h0);
+        turnRight(spd);
+        delay(600);
+        motorsStop();
+        delay(1200);
+        for (int i = 0; i < 8; i++) { hmcHeading(); delay(15); }
+        float h1 = hmcHeadingInstant(12);
+        delta = h1 - h0;
+        if (delta >  180.0f) delta -= 360.0f;
+        if (delta < -180.0f) delta += 360.0f;
+        wlogf("[HMC] TurnSign: h0=%.1f h1=%.1f delta=%.1f\n", h0, h1, delta);
+        if (fabsf(delta) >= 2.0f) break;  // movió suficiente — fiable
+        spd = (uint8_t)min((int)spd + 25, 255);
+        wlogf("[HMC] Delta insuficiente — subiendo a SPD=%u\n", spd);
+    }
+
     gTurnSign = (delta >= 0.0f) ? +1 : -1;
-    wlogf("[HMC] TurnSign: h0=%.1f h1=%.1f delta=%.1f -> turnSign=%+d\n",
-          h0, h1, delta, gTurnSign);
+    wlogf("[HMC] TurnSign final: %+d\n", gTurnSign);
 }
 
 bool faceNorth() {
     const float    TOL_DEG   =  5.0f;
-    const uint8_t  SPD_CONT  = 165;   // velocidad rápida (>10°)
-    const uint8_t  SPD_VSLOW = 100;   // velocidad muy lenta (≤10°)
     const uint32_t TIMEOUT   = 60000;
+
+    // Velocidad adaptativa para faceNorth — sube si el robot no mueve
+    uint8_t SPD_CONT  = 165;
+    uint8_t SPD_VSLOW = 100;
+    const uint8_t SPD_MAX = 255;
+    const uint8_t SPD_STEP = 15;          // cuánto subir por pulso sin movimiento
+    const float   MIN_DELTA_DEG = 1.5f;   // mínimo cambio de heading para considerarse "movido"
 
     wlogf("[HMC] Orientando al Norte (turnSign=%+d)...\n", gTurnSign);
 
@@ -611,24 +626,43 @@ bool faceNorth() {
         bool goRight = (err * gTurnSign) > 0.0f;
 
         if (absErr > 10.0f) {
-            // Lejos: giro continuo 250ms + asentar 1200ms para lectura limpia
+            // Lejos: giro continuo 250ms — medir delta para detectar si mueve
+            float hBefore = hmcHeadingInstant(6);
             if (goRight) turnRight(SPD_CONT); else turnLeft(SPD_CONT);
             delay(250);
             motorsStop();
             delay(1200);
-            // Releer varias veces para que el filtro se estabilice
             for (int i = 0; i < 5; i++) { hmcHeading(); delay(15); }
+            float hAfter = hmcHeadingInstant(6);
+            float delta = fabsf(hAfter - hBefore);
+            if (delta > 180.0f) delta = 360.0f - delta;
+            if (delta < MIN_DELTA_DEG) {
+                // El robot no giró — subir fuerza
+                if (SPD_CONT < SPD_MAX) {
+                    SPD_CONT = (uint8_t)min((int)SPD_CONT + SPD_STEP, (int)SPD_MAX);
+                    wlogf("[HMC] Sin movimiento — SPD_CONT sube a %u\n", SPD_CONT);
+                }
+            }
         } else {
             // Muy cerca (≤10°): pulso muy corto y muy lento
             uint16_t pulseMs = (uint16_t)(absErr * 4.0f);
             if (pulseMs < 30)  pulseMs = 30;
             if (pulseMs > 80)  pulseMs = 80;
+            float hBefore = hmcHeadingInstant(4);
             if (goRight) turnRight(SPD_VSLOW); else turnLeft(SPD_VSLOW);
             delay(pulseMs);
             motorsStop();
-            delay(1800);  // más tiempo de asentamiento cerca del Norte
-            // Releer más veces para máxima estabilidad
+            delay(1800);
             for (int i = 0; i < 10; i++) { hmcHeading(); delay(15); }
+            float hAfter = hmcHeadingInstant(4);
+            float delta = fabsf(hAfter - hBefore);
+            if (delta > 180.0f) delta = 360.0f - delta;
+            if (delta < MIN_DELTA_DEG) {
+                if (SPD_VSLOW < SPD_MAX) {
+                    SPD_VSLOW = (uint8_t)min((int)SPD_VSLOW + SPD_STEP, (int)SPD_MAX);
+                    wlogf("[HMC] Sin movimiento fino — SPD_VSLOW sube a %u\n", SPD_VSLOW);
+                }
+            }
         }
     }
 
@@ -1250,9 +1284,16 @@ void sendTelemetry() {
 //  NAVEGACIÓN GPS
 // =============================================================
 #define WAYPOINT_REACH_M  2.0f   // metros para considerar waypoint alcanzado
-#define BASE_SPEED          200   // velocidad normal
+#define BASE_SPEED          200   // velocidad normal (punto de partida)
 #define TURN_SPEED          160   // velocidad al girar
 #define HEADING_TOL_DEG    15.0f  // ±15° de tolerancia de rumbo
+// Velocidad adaptativa
+#define NAV_MIN_SPEED       130   // PWM mínimo (nunca bajar de aquí)
+#define NAV_MAX_SPEED       255   // PWM máximo
+#define NAV_TARGET_MPS     0.30f  // velocidad objetivo en m/s (calibrar en llano)
+#define NAV_KP             30.0f  // ganancia proporcional (PWM por m/s de error)
+
+static uint8_t  gAdaptiveSpeed = BASE_SPEED;  // PWM actual — adaptado al terreno
 
 void navigate() {
     if (!navActive) return;
@@ -1305,25 +1346,59 @@ void navigate() {
     if (err >  180.0f) err -= 360.0f;
     if (err < -180.0f) err += 360.0f;
 
+    // ── Velocidad adaptativa (solo mientras avanza en línea recta) ──
+    {
+        static double   prevLat = 0, prevLon = 0;
+        static uint32_t prevAge = UINT32_MAX;
+        static unsigned long prevMs = 0;
+
+        uint32_t age = (uint32_t)gps.location.age();
+        // Detectar nueva muestra GPS: age retrocede (dato fresco)
+        if (age < prevAge && prevAge != UINT32_MAX && prevMs != 0) {
+            unsigned long dt_ms = millis() - prevMs;
+            if (dt_ms > 200 && dt_ms < 5000) {
+                float moved = gpsDistanceTo((float)prevLat, (float)prevLon, lat, lon);
+                float actualMps = moved / (dt_ms / 1000.0f);
+
+                // Solo ajustar si vamos en dirección correcta (rumbo OK)
+                if (fabsf(err) <= HEADING_TOL_DEG && actualMps < 3.0f) {
+                    float speedErr = NAV_TARGET_MPS - actualMps;  // >0 → más lento de lo esperado
+                    int16_t adj = (int16_t)(speedErr * NAV_KP);
+                    int16_t newSpd = (int16_t)gAdaptiveSpeed + adj;
+                    if (newSpd < NAV_MIN_SPEED) newSpd = NAV_MIN_SPEED;
+                    if (newSpd > NAV_MAX_SPEED) newSpd = NAV_MAX_SPEED;
+                    gAdaptiveSpeed = (uint8_t)newSpd;
+                    wlogf("[NAV] Velocidad adaptada: %.2fm/s → PWM=%u (adj=%+d)\r\n",
+                          actualMps, gAdaptiveSpeed, adj);
+                }
+            }
+            prevMs = millis();
+        } else if (age < prevAge) {
+            prevMs = millis();
+        }
+        prevAge = age;
+        prevLat = lat;
+        prevLon = lon;
+    }
+
     // Log periódico cada 2 s para no saturar telnet
     static unsigned long lastNavLog = 0;
     if (millis() - lastNavLog > 2000) {
         lastNavLog = millis();
-        wlogf("[NAV] WP%u/%u  dist=%.1fm  tgt=%.0f  hdg=%.0f  err=%+.0f\r\n",
+        wlogf("[NAV] WP%u/%u  dist=%.1fm  tgt=%.0f  hdg=%.0f  err=%+.0f  PWM=%u\r\n",
               currentWaypoint + 1, waypointCount,
-              dist, targetCourse, compassCourse, err);
+              dist, targetCourse, compassCourse, err, gAdaptiveSpeed);
     }
 
     if (fabsf(err) > HEADING_TOL_DEG) {
-        // gTurnSign: +1 si turnRight sube heading, -1 si lo baja
-        // err > 0 → necesitamos aumentar heading → girar según gTurnSign
+        // Mientras gira, no ajustamos gAdaptiveSpeed (movimiento lateral no mide carga)
         uint8_t tSpd = (fabsf(err) > 60.0f) ? TURN_SPEED
                                               : (uint8_t)(TURN_SPEED * 0.65f);
         if ((err * gTurnSign) > 0.0f) turnRight(tSpd);
         else                           turnLeft(tSpd);
     } else {
-        // Rumbo correcto — avanzar, más despacio al acercarse
-        uint8_t spd = (dist < 3.0f) ? 120 : BASE_SPEED;
+        // Rumbo correcto — avanzar con velocidad adaptativa (más lento al llegar)
+        uint8_t spd = (dist < 3.0f) ? NAV_MIN_SPEED : gAdaptiveSpeed;
         moveForward(spd);
     }
 }
@@ -1545,6 +1620,7 @@ static bool processTelnetCmd(const char *cmd) {
         waypointCount   = 0;
         if (requestWaypoints()) {
             navActive = true;
+            gAdaptiveSpeed = BASE_SPEED;  // reset velocidad adaptativa
             char buf[22];
             snprintf(buf, sizeof(buf), "%u waypoints OK", waypointCount);
             wlogf("[CMD] %s — navegacion iniciada\r\n", buf);
@@ -1653,6 +1729,7 @@ void loop() {
         oledShow("Pidiendo WP", "868MHz SF7...", "");
         if (requestWaypoints()) {
             navActive = true;
+            gAdaptiveSpeed = BASE_SPEED;  // reset velocidad adaptativa
             wlogf("[SYS] Waypoints recibidos OK\r\n");
         } else {
             wlogf("[SYS] No se recibieron waypoints\r\n");
