@@ -122,8 +122,8 @@ static void telnetHandle() {
 #define PIN_VEXT       36
 
 // GPS (UART1)
-#define PIN_GPS_RX      1
-#define PIN_GPS_TX      2
+#define PIN_GPS_RX     45
+#define PIN_GPS_TX     46
 
 // I2C Hardware — HMC5883L
 #define PIN_I2C_SDA     6
@@ -195,37 +195,37 @@ struct __attribute__((packed)) WaypointPacket {
     uint8_t msgType;
     uint8_t waypointId;     // 1-based
     uint8_t totalWaypoints;
-    float   latitude;
-    float   longitude;
+    int32_t latitude;       // microgrados × 1e6
+    int32_t longitude;      // microgrados × 1e6
     uint8_t checksum;       // XOR de todos los bytes anteriores
 };
 
 struct __attribute__((packed)) TelemetryPacket {
-    uint8_t msgType;
-    float   latitude;
-    float   longitude;
-    uint8_t satellites;
-    uint8_t gpsFixed;
-    uint8_t currentWaypoint;
-    float   distanceToWaypoint;
-    float   headingToWaypoint;
-    int16_t rssi;
-    float   snr;
-    uint8_t batteryLevel;
-    uint8_t checksum;
+    uint8_t  msgType;
+    int32_t  latitude;          // microgrados × 1e6 (ej. 37283115 = 37.283115°)
+    int32_t  longitude;         // microgrados × 1e6
+    uint8_t  satellites;
+    uint8_t  gpsFixed;
+    uint8_t  currentWaypoint;
+    float    distanceToWaypoint;
+    float    headingToWaypoint;
+    int16_t  rssi;
+    float    snr;
+    uint8_t  batteryLevel;
+    uint8_t  checksum;
 };
 
 // =============================================================
 //  ESTADO GLOBAL
 // =============================================================
-struct Waypoint { float lat, lon; };
+struct Waypoint { double lat, lon; };
 Waypoint waypoints[MAX_WAYPOINTS];
 uint8_t  waypointCount   = 0;
 uint8_t  currentWaypoint = 0;
 bool     navActive       = false;
 // +1 si turnRight() sube el heading, -1 si lo baja.
 // Se detecta automáticamente al arrancar (detectTurnSign).
-static int gTurnSign = -1;
+static int gTurnSign = +1;
 
 #define TELEMETRY_INTERVAL_MS 2000UL
 static unsigned long lastTelemetryMs = 0;
@@ -248,6 +248,17 @@ Preferences    prefs;   // NVS — calibración HMC5883L
 void motorsStop();
 void turnRight(uint8_t spd);
 void turnLeft(uint8_t spd);
+
+// Drena el buffer del GPS y el telnet sin bloquear.
+// Usar en lugar de delay() dentro de funciones largas.
+static void gpsDelay(uint32_t ms) {
+    unsigned long t0 = millis();
+    while (millis() - t0 < ms) {
+        while (gpsSerial.available()) gps.encode(gpsSerial.read());
+        telnetHandle();
+        delay(2);
+    }
+}
 void moveForward(uint8_t spd);
 void oledShow(const char *l1, const char *l2 = "", const char *l3 = "");
 void driveStraight(float distanceM, uint8_t baseSpd);
@@ -405,15 +416,15 @@ float hmcHeading() {
 void hmcCalibrate() {
     motorsStop();  // garantizar motores parados
 
-    wlogf("[HMC] Calibrando — GIRA EL ROBOT A MANO 360 durante 20s");
-    oledShow("CALIBRA HMC", "GIRA A MANO", "20 segundos...");
+    wlogf("[HMC] Calibrando — GIRA EL ROBOT A MANO 360 durante 40s");
+    oledShow("CALIBRA HMC", "GIRA A MANO", "40 segundos...");
 
     int16_t xMin = 32767, xMax = -32768;
     int16_t yMin = 32767, yMax = -32768;
     uint32_t samples = 0;
 
     // Cuenta atrás visual en OLED
-    for (int seg = 20; seg > 0; seg--) {
+    for (int seg = 40; seg > 0; seg--) {
         unsigned long t0 = millis();
         while (millis() - t0 < 1000) {
             int16_t x, y, z;
@@ -447,11 +458,15 @@ void hmcCalibrate() {
     wlogf("[HMC]   offX=%d offY=%d  scX=%.3f scY=%.3f\n",
                   hmcOffX, hmcOffY, hmcScaleX, hmcScaleY);
 
-    // Advertir si el rango es demasiado pequeño (calibración insuficiente)
-    if (rX < 80.0f || rY < 80.0f) {
-        wlogf("[HMC] WARN: rango muy pequeño (rX=%.0f rY=%.0f) — gira mas despacio y mas vueltas!\n", rX, rY);
-        oledShow("Cal DUDOSA", "Rango pequeño", "Repite calibrar");
-        delay(3000);
+    // Validar calidad: rango mínimo y simetría entre ejes
+    float asymmetry = fabsf(rX - rY) / max(rX, rY);  // 0=perfecto, 1=muy asimétrico
+    bool calOk = (rX >= 100.0f && rY >= 100.0f && asymmetry < 0.4f);
+    wlogf("[HMC]   asimetria=%.2f  calidad=%s\n", asymmetry, calOk ? "OK" : "DUDOSA");
+
+    if (!calOk) {
+        wlogf("[HMC] WARN: calibracion dudosa (rX=%.0f rY=%.0f asim=%.2f) — repite!\n", rX, rY, asymmetry);
+        oledShow("Cal DUDOSA!", "Repite calibrar", "mas vueltas");
+        delay(4000);
     } else {
         oledShow("Cal guardada", "en Flash OK", "");
     }
@@ -808,10 +823,10 @@ void mpuCalibrateGyro(uint16_t samples = 500) {
 static void driveMotors(int16_t spdA, int16_t spdB) {
     spdA = constrain(spdA, -255, 255);
     spdB = constrain(spdB, -255, 255);
-    if (spdA >= 0) { ledcWrite(CH_A_IN1, spdA); ledcWrite(CH_A_IN2, 0); }
-    else            { ledcWrite(CH_A_IN1, 0);    ledcWrite(CH_A_IN2, -spdA); }
-    if (spdB >= 0) { ledcWrite(CH_B_IN1, spdB); ledcWrite(CH_B_IN2, 0); }
-    else            { ledcWrite(CH_B_IN1, 0);    ledcWrite(CH_B_IN2, -spdB); }
+    if (spdA >= 0) { ledcWrite(CH_A_IN1, spdA);  ledcWrite(CH_A_IN2, 0); }
+    else            { ledcWrite(CH_A_IN1, 0);     ledcWrite(CH_A_IN2, -spdA); }
+    if (spdB >= 0) { ledcWrite(CH_B_IN1, spdB);  ledcWrite(CH_B_IN2, 0); }
+    else            { ledcWrite(CH_B_IN1, 0);     ledcWrite(CH_B_IN2, -spdB); }
 }
 
 // Avanza en línea recta durante 'distanceM' metros usando PID sobre el heading.
@@ -1082,24 +1097,24 @@ void gpsAutoDetect() {
     wlogf("[GPS] No detectado — usando 9600 bps");
 }
 
-static float gpsDistanceTo(float lat1, float lon1, float lat2, float lon2) {
-    const float R = 6371000.0f;
-    float dLat = (lat2 - lat1) * (float)M_PI / 180.0f;
-    float dLon = (lon2 - lon1) * (float)M_PI / 180.0f;
-    float a = sinf(dLat * 0.5f) * sinf(dLat * 0.5f)
-            + cosf(lat1 * (float)M_PI / 180.0f) * cosf(lat2 * (float)M_PI / 180.0f)
-            * sinf(dLon * 0.5f) * sinf(dLon * 0.5f);
-    return R * 2.0f * atan2f(sqrtf(a), sqrtf(1.0f - a));
+static float gpsDistanceTo(double lat1, double lon1, double lat2, double lon2) {
+    const double R = 6371000.0;
+    double dLat = (lat2 - lat1) * M_PI / 180.0;
+    double dLon = (lon2 - lon1) * M_PI / 180.0;
+    double a = sin(dLat * 0.5) * sin(dLat * 0.5)
+             + cos(lat1 * M_PI / 180.0) * cos(lat2 * M_PI / 180.0)
+             * sin(dLon * 0.5) * sin(dLon * 0.5);
+    return (float)(R * 2.0 * atan2(sqrt(a), sqrt(1.0 - a)));
 }
 
-static float gpsCourseTo(float lat1, float lon1, float lat2, float lon2) {
-    float dLon = (lon2 - lon1) * (float)M_PI / 180.0f;
-    float y = sinf(dLon) * cosf(lat2 * (float)M_PI / 180.0f);
-    float x = cosf(lat1 * (float)M_PI / 180.0f) * sinf(lat2 * (float)M_PI / 180.0f)
-             - sinf(lat1 * (float)M_PI / 180.0f) * cosf(lat2 * (float)M_PI / 180.0f) * cosf(dLon);
-    float c = atan2f(y, x) * 180.0f / (float)M_PI;
-    if (c < 0.0f) c += 360.0f;
-    return c;
+static float gpsCourseTo(double lat1, double lon1, double lat2, double lon2) {
+    double dLon = (lon2 - lon1) * M_PI / 180.0;
+    double y = sin(dLon) * cos(lat2 * M_PI / 180.0);
+    double x = cos(lat1 * M_PI / 180.0) * sin(lat2 * M_PI / 180.0)
+              - sin(lat1 * M_PI / 180.0) * cos(lat2 * M_PI / 180.0) * cos(dLon);
+    double c = atan2(y, x) * 180.0 / M_PI;
+    if (c < 0.0) c += 360.0;
+    return (float)c;
 }
 
 // =============================================================
@@ -1209,11 +1224,11 @@ bool requestWaypoints() {
                 if (cs == pkt->checksum) {
                     uint8_t idx = pkt->waypointId - 1;
                     if (idx < MAX_WAYPOINTS) {
-                        waypoints[idx].lat = pkt->latitude;
-                        waypoints[idx].lon = pkt->longitude;
+                        waypoints[idx].lat = pkt->latitude  / 1e6;
+                        waypoints[idx].lon = pkt->longitude / 1e6;
                         waypointCount++;
                         wlogf("[WP] WP%u lat=%.6f lon=%.6f\r\n",
-                              pkt->waypointId, pkt->latitude, pkt->longitude);
+                              pkt->waypointId, waypoints[idx].lat, waypoints[idx].lon);
                     }
                 } else {
                     wlogf("[WP] Checksum BAD (got=0x%02X exp=0x%02X)\r\n", cs, pkt->checksum);
@@ -1250,18 +1265,16 @@ bool requestWaypoints() {
 void sendTelemetry() {
     TelemetryPacket pkt = {};
     pkt.msgType          = MSG_TELEMETRY;
-    pkt.latitude         = gps.location.isValid() ? (float)gps.location.lat()  : 0.0f;
-    pkt.longitude        = gps.location.isValid() ? (float)gps.location.lng()  : 0.0f;
+    pkt.latitude         = gps.location.isValid() ? (int32_t)(gps.location.lat() * 1e6) : 0;
+    pkt.longitude        = gps.location.isValid() ? (int32_t)(gps.location.lng() * 1e6) : 0;
     pkt.satellites       = gps.satellites.isValid() ? gps.satellites.value()   : 0;
     pkt.gpsFixed         = gps.location.isValid() ? 1 : 0;
     pkt.currentWaypoint  = currentWaypoint;
 
     if (navActive && gps.location.isValid() && waypointCount > 0) {
-        float lat = (float)gps.location.lat();
-        float lon = (float)gps.location.lng();
-        pkt.distanceToWaypoint = gpsDistanceTo(lat, lon,
+        pkt.distanceToWaypoint = gpsDistanceTo(gps.location.lat(), gps.location.lng(),
             waypoints[currentWaypoint].lat, waypoints[currentWaypoint].lon);
-        pkt.headingToWaypoint  = gpsCourseTo(lat, lon,
+        pkt.headingToWaypoint  = gpsCourseTo(gps.location.lat(), gps.location.lng(),
             waypoints[currentWaypoint].lat, waypoints[currentWaypoint].lon);
     }
 
@@ -1327,10 +1340,10 @@ void navigate() {
         return;
     }
 
-    float lat  = (float)gps.location.lat();
-    float lon  = (float)gps.location.lng();
-    float tLat = waypoints[currentWaypoint].lat;
-    float tLon = waypoints[currentWaypoint].lon;
+    double lat  = gps.location.lat();
+    double lon  = gps.location.lng();
+    double tLat = waypoints[currentWaypoint].lat;
+    double tLon = waypoints[currentWaypoint].lon;
 
     float dist = gpsDistanceTo(lat, lon, tLat, tLon);
 
@@ -1350,7 +1363,9 @@ void navigate() {
     }
 
     float targetCourse  = gpsCourseTo(lat, lon, tLat, tLon);
-    float compassCourse = hmcHeading();
+    // hmcHeadingInstant: lectura instantánea sin tocar filteredHeading.
+    // No llamamos hmcHeading() con motores en marcha — contaminaría el filtro paso-bajo.
+    float compassCourse = hmcHeadingInstant(4);
 
     float err = targetCourse - compassCourse;
     if (err >  180.0f) err -= 360.0f;
@@ -1367,7 +1382,7 @@ void navigate() {
         if (age < prevAge && prevAge != UINT32_MAX && prevMs != 0) {
             unsigned long dt_ms = millis() - prevMs;
             if (dt_ms > 200 && dt_ms < 5000) {
-                float moved = gpsDistanceTo((float)prevLat, (float)prevLon, lat, lon);
+                float moved = gpsDistanceTo(prevLat, prevLon, lat, lon);
                 float actualMps = moved / (dt_ms / 1000.0f);
 
                 // Solo ajustar si vamos en dirección correcta (rumbo OK)
@@ -1398,6 +1413,12 @@ void navigate() {
         wlogf("[NAV] WP%u/%u  dist=%.1fm  tgt=%.0f  hdg=%.0f  err=%+.0f  PWM=%u\r\n",
               currentWaypoint + 1, waypointCount,
               dist, targetCourse, compassCourse, err, gAdaptiveSpeed);
+        wlogf("[GPS] fix=%s  sats=%u  age=%lums  chars=%lu  lat=%.6f  lon=%.6f\r\n",
+              gps.location.isValid() ? "SI" : "NO",
+              gps.satellites.isValid() ? gps.satellites.value() : 0,
+              (unsigned long)gps.location.age(),
+              (unsigned long)gps.charsProcessed(),
+              gps.location.lat(), gps.location.lng());
     }
 
     // ── Giro: parar → medir → pulso → repetir ────────────────────────────
@@ -1407,8 +1428,10 @@ void navigate() {
     // Para GPS (1 Hz) esta cadencia es más que suficiente.
     static uint8_t  turnSpeedNav  = TURN_SPEED;
     static uint32_t turnCooldownEnd = 0;
+    static int8_t   turnDirLocked = 0;  // +1=right, -1=left, 0=libre — histéresis anti-180°
     const  float    TURN_ENTER_DEG = 20.0f;
     const  float    TURN_EXIT_DEG  =  8.0f;
+    const  float    TURN_DIR_HYST  = 20.0f;  // margen para cambiar dirección bloqueada
     const  uint32_t TURN_COOLDOWN  = 500;      // ms sin girar tras alinearse
     const  uint8_t  TURN_ADAPT_STEP = 20;
 
@@ -1416,7 +1439,7 @@ void navigate() {
         // ── Necesita girar: pulso bloqueante con medición limpia ──
         // 1. Parar y dejar disipar el campo magnético de los motores
         motorsStop();
-        delay(300);
+        gpsDelay(600);
 
         // 2. Leer heading con motores parados (lectura fiable)
         float cleanH = hmcHeadingInstant(8);
@@ -1424,19 +1447,28 @@ void navigate() {
         if (cleanErr >  180.0f) cleanErr -= 360.0f;
         if (cleanErr < -180.0f) cleanErr += 360.0f;
 
-        wlogf("[NAV] GIRO: hdg=%.0f tgt=%.0f err=%+.0f spd=%u\r\n",
-              cleanH, targetCourse, cleanErr, turnSpeedNav);
+        // Histéresis de dirección: cerca de ±180° el signo oscila con el ruido.
+        // Solo cambiamos la dirección bloqueada si el nuevo signo es claro (>HYST).
+        int8_t newDir = (cleanErr >= 0.0f) ? +1 : -1;
+        if (turnDirLocked == 0) {
+            turnDirLocked = newDir;
+        } else if (newDir != turnDirLocked && fabsf(cleanErr) < (180.0f - TURN_DIR_HYST)) {
+            turnDirLocked = newDir;  // solo cambiar si NO estamos cerca de 180°
+        }
+
+        wlogf("[NAV] GIRO: hdg=%.0f tgt=%.0f err=%+.0f spd=%u dir=%+d\r\n",
+              cleanH, targetCourse, cleanErr, turnSpeedNav, turnDirLocked);
 
         if (fabsf(cleanErr) > TURN_EXIT_DEG) {
             // 3. Aplicar pulso proporcional al error
             uint16_t pulseMs = (uint16_t)constrain(fabsf(cleanErr) * 5.0f, 80.0f, 350.0f);
-            if ((cleanErr * gTurnSign) > 0.0f) turnRight(turnSpeedNav);
-            else                                turnLeft(turnSpeedNav);
-            delay(pulseMs);
+            if ((turnDirLocked * gTurnSign) > 0) turnRight(turnSpeedNav);
+            else                                  turnLeft(turnSpeedNav);
+            gpsDelay(pulseMs);
             motorsStop();
 
-            // 4. Verificar que giró (campo disipado: esperar 300ms)
-            delay(300);
+            // 4. Verificar que giró (campo disipado: esperar 600ms)
+            gpsDelay(600);
             float h2 = hmcHeadingInstant(6);
             float moved = fabsf(h2 - cleanH);
             if (moved > 180.0f) moved = 360.0f - moved;
@@ -1448,6 +1480,7 @@ void navigate() {
         } else {
             // Ya alineado tras la medición limpia
             turnSpeedNav   = TURN_SPEED;
+            turnDirLocked  = 0;
             turnCooldownEnd = millis() + TURN_COOLDOWN;
             wlogf("[NAV] Alineado: hdg=%.0f\r\n", cleanH);
         }
@@ -1455,6 +1488,7 @@ void navigate() {
         // Rumbo correcto — avanzar
         if (fabsf(err) < TURN_EXIT_DEG) {
             turnSpeedNav   = TURN_SPEED;   // reset para el próximo giro
+            turnDirLocked  = 0;
             turnCooldownEnd = millis() + TURN_COOLDOWN;
         }
         uint8_t spd = (dist < 3.0f) ? NAV_MIN_SPEED : gAdaptiveSpeed;
@@ -1544,8 +1578,8 @@ void returnToOrigin(uint32_t advanceMs = 8000, uint8_t spd = 200) {
         delay(2000);
         return;
     }
-    float originLat = (float)gps.location.lat();
-    float originLon = (float)gps.location.lng();
+    double originLat = gps.location.lat();
+    double originLon = gps.location.lng();
     wlogf("[RTO] Origen: %.6f, %.6f\r\n", originLat, originLon);
     oledShow("Retorno", "Origen guardado", "Avanzando...");
     delay(500);
@@ -1602,8 +1636,8 @@ void returnToOrigin(uint32_t advanceMs = 8000, uint8_t spd = 200) {
 
         if (!gps.location.isValid()) { delay(100); continue; }
 
-        float lat = (float)gps.location.lat();
-        float lon = (float)gps.location.lng();
+        double lat = gps.location.lat();
+        double lon = gps.location.lng();
         float dist = gpsDistanceTo(lat, lon, originLat, originLon);
         float course = gpsCourseTo(lat, lon, originLat, originLon);
         float heading = hmcHeading();
@@ -1852,5 +1886,5 @@ void loop() {
         oledShow(l1, l2, l3);
     }
 
-    delay(50);
+    gpsDelay(50);
 }
