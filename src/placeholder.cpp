@@ -1267,7 +1267,19 @@ void sendTelemetry() {
 
     pkt.rssi         = (int16_t)radio.getRSSI();
     pkt.snr          = radio.getSNR();
-    pkt.batteryLevel = 100;  // TODO: medir batería real
+    // Heltec V3: GPIO37 activa el ADC de batería, GPIO1 lee VBAT (divisor 1:2)
+    pinMode(37, OUTPUT);
+    digitalWrite(37, LOW);          // LOW = habilitar lectura
+    delay(5);
+    int raw = analogRead(1);        // 12-bit: 0-4095
+    digitalWrite(37, HIGH);         // HIGH = deshabilitar (ahorra energía)
+    // El divisor 1:2 con Vref 3.3V: Vbat = raw * 3.3 * 2 / 4095
+    float vbat = raw * (3.3f * 2.0f / 4095.0f);
+    // LiPo: 4.2V = 100%, 3.0V = 0%
+    int pct = (int)((vbat - 3.0f) / (4.2f - 3.0f) * 100.0f);
+    if (pct > 100) pct = 100;
+    if (pct < 0)   pct = 0;
+    pkt.batteryLevel = (uint8_t)pct;
 
     // Checksum = suma de todos los bytes excepto el último
     uint8_t *ptr = (uint8_t *)&pkt;
@@ -1805,6 +1817,12 @@ void loop() {
 
     // ── Navegación ──
     if (navActive) navigate();
+
+    // ── Telemetría cada TELEMETRY_INTERVAL_MS ──
+    if (millis() - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
+        lastTelemetryMs = millis();
+        sendTelemetry();
+    }
 
     // ── OLED cada 500 ms ──
     static unsigned long lastOled = 0;
