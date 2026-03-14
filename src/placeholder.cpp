@@ -225,7 +225,7 @@ uint8_t  currentWaypoint = 0;
 bool     navActive       = false;
 // +1 si turnRight() sube el heading, -1 si lo baja.
 // Se detecta automáticamente al arrancar (detectTurnSign).
-static int gTurnSign = +1;
+static int gTurnSign = -1;
 
 #define TELEMETRY_INTERVAL_MS 2000UL
 static unsigned long lastTelemetryMs = 0;
@@ -376,12 +376,10 @@ float hmcHeading() {
     int16_t mx, my, mz;
     if (!hmcRead(mx, my, mz)) return filteredHeading;
 
-    // Remapeo físico: sensor_X apunta izquierda, sensor_Y apunta atrás.
-    // Con eje Z apuntando arriba:
-    //   Norte (frente robot) = -sensor_Y  (sensor_Y apunta atrás → Norte es opuesto)
-    //   Este  (derecha robot) = -sensor_X  (sensor_X apunta izquierda → Este es opuesto)
-    float fx = -(float)(my - hmcOffY) * hmcScaleY;   // Norte = -sensor_Y
-    float fy = -(float)(mx - hmcOffX) * hmcScaleX;   // Este  = -sensor_X
+    // Remapeo físico corregido: sensor montado 180° respecto al original.
+    // Se invierten los signos para que Norte = frente real del robot.
+    float fx = (float)(my - hmcOffY) * hmcScaleY;
+    float fy = (float)(mx - hmcOffX) * hmcScaleX;
 
     float h = atan2f(fy, fx) * 180.0f / (float)M_PI;
     if (h < 0.0f) h += 360.0f;
@@ -514,9 +512,9 @@ float hmcHeadingInstant(uint8_t n = 6) {
         int16_t mx, my, mz;
         // Usar hmcReadRaw: DRDY ya fue confirmado justo arriba, no re-leer status
         if (!hmcReadRaw(mx, my, mz)) continue;
-        // Remapeo físico: sensor_X apunta izquierda, sensor_Y apunta atrás
-        float fx = -(float)(my - hmcOffY) * hmcScaleY;   // Norte = -sensor_Y
-        float fy = -(float)(mx - hmcOffX) * hmcScaleX;   // Este  = -sensor_X
+        // Remapeo físico corregido (sensor montado 180°)
+        float fx = (float)(my - hmcOffY) * hmcScaleY;
+        float fy = (float)(mx - hmcOffX) * hmcScaleX;
         float angle = atan2f(fy, fx);
         sinSum += sinf(angle);
         cosSum += cosf(angle);
@@ -1390,14 +1388,63 @@ void navigate() {
               dist, targetCourse, compassCourse, err, gAdaptiveSpeed);
     }
 
-    if (fabsf(err) > HEADING_TOL_DEG) {
-        // Mientras gira, no ajustamos gAdaptiveSpeed (movimiento lateral no mide carga)
-        uint8_t tSpd = (fabsf(err) > 60.0f) ? TURN_SPEED
-                                              : (uint8_t)(TURN_SPEED * 0.65f);
-        if ((err * gTurnSign) > 0.0f) turnRight(tSpd);
-        else                           turnLeft(tSpd);
+    // ── Giro: parar → medir → pulso → repetir ────────────────────────────
+    // Los motores interfieren electromagnéticamente con el HMC5883L.
+    // La única lectura fiable es con motores PARADOS y campo disipado.
+    // Patrón: stop 300ms → leer heading → si necesita girar → pulso → repetir.
+    // Para GPS (1 Hz) esta cadencia es más que suficiente.
+    static uint8_t  turnSpeedNav  = TURN_SPEED;
+    static uint32_t turnCooldownEnd = 0;
+    const  float    TURN_ENTER_DEG = 20.0f;
+    const  float    TURN_EXIT_DEG  =  8.0f;
+    const  uint32_t TURN_COOLDOWN  = 500;      // ms sin girar tras alinearse
+    const  uint8_t  TURN_ADAPT_STEP = 20;
+
+    if (fabsf(err) > TURN_ENTER_DEG && millis() >= turnCooldownEnd) {
+        // ── Necesita girar: pulso bloqueante con medición limpia ──
+        // 1. Parar y dejar disipar el campo magnético de los motores
+        motorsStop();
+        delay(300);
+
+        // 2. Leer heading con motores parados (lectura fiable)
+        float cleanH = hmcHeadingInstant(8);
+        float cleanErr = targetCourse - cleanH;
+        if (cleanErr >  180.0f) cleanErr -= 360.0f;
+        if (cleanErr < -180.0f) cleanErr += 360.0f;
+
+        wlogf("[NAV] GIRO: hdg=%.0f tgt=%.0f err=%+.0f spd=%u\r\n",
+              cleanH, targetCourse, cleanErr, turnSpeedNav);
+
+        if (fabsf(cleanErr) > TURN_EXIT_DEG) {
+            // 3. Aplicar pulso proporcional al error
+            uint16_t pulseMs = (uint16_t)constrain(fabsf(cleanErr) * 5.0f, 80.0f, 350.0f);
+            if ((cleanErr * gTurnSign) > 0.0f) turnRight(turnSpeedNav);
+            else                                turnLeft(turnSpeedNav);
+            delay(pulseMs);
+            motorsStop();
+
+            // 4. Verificar que giró (campo disipado: esperar 300ms)
+            delay(300);
+            float h2 = hmcHeadingInstant(6);
+            float moved = fabsf(h2 - cleanH);
+            if (moved > 180.0f) moved = 360.0f - moved;
+            if (moved < 2.0f && turnSpeedNav < NAV_MAX_SPEED) {
+                turnSpeedNav = (uint8_t)min((int)turnSpeedNav + TURN_ADAPT_STEP,
+                                            (int)NAV_MAX_SPEED);
+                wlogf("[NAV] Giro estancado — TurnSpd sube a %u\r\n", turnSpeedNav);
+            }
+        } else {
+            // Ya alineado tras la medición limpia
+            turnSpeedNav   = TURN_SPEED;
+            turnCooldownEnd = millis() + TURN_COOLDOWN;
+            wlogf("[NAV] Alineado: hdg=%.0f\r\n", cleanH);
+        }
     } else {
-        // Rumbo correcto — avanzar con velocidad adaptativa (más lento al llegar)
+        // Rumbo correcto — avanzar
+        if (fabsf(err) < TURN_EXIT_DEG) {
+            turnSpeedNav   = TURN_SPEED;   // reset para el próximo giro
+            turnCooldownEnd = millis() + TURN_COOLDOWN;
+        }
         uint8_t spd = (dist < 3.0f) ? NAV_MIN_SPEED : gAdaptiveSpeed;
         moveForward(spd);
     }
@@ -1442,7 +1489,7 @@ void setup() {
     // ── HMC5883L ──
     if (hmcInit()) {
         bool calLoaded = hmcLoadCalibration();
-        gTurnSign = -1;  // +1: turnRight() sube heading. Cambiar a -1 si es al revés.
+        gTurnSign = -1;  // turnRight() baja el heading en este robot.
         wlogf("[HMC] TurnSign hardcoded = %+d\r\n", gTurnSign);
         if (calLoaded) {
             wlogf("[HMC] Calibracion cargada — buscando Norte...\r\n");
@@ -1567,8 +1614,24 @@ void returnToOrigin(uint32_t advanceMs = 8000, uint8_t spd = 200) {
             return;
         }
 
+        // Giro adaptativo en retorno: igual lógica que navigate()
         if (fabsf(err) > 15.0f) {
-            if ((err * gTurnSign) > 0.0f) turnRight(TURN_SPEED); else turnLeft(TURN_SPEED);
+            static uint8_t  rtoTurnSpd      = TURN_SPEED;
+            static float    rtoHdgPrev      = -1.0f;
+            static uint32_t rtoLastCheckMs  = 0;
+            uint32_t nowMs = millis();
+            if (rtoHdgPrev < 0.0f) {
+                rtoHdgPrev = heading; rtoLastCheckMs = nowMs;
+            } else if (nowMs - rtoLastCheckMs >= 400) {
+                float d = fabsf(heading - rtoHdgPrev);
+                if (d > 180.0f) d = 360.0f - d;
+                if (d < 2.0f && rtoTurnSpd < NAV_MAX_SPEED) {
+                    rtoTurnSpd = (uint8_t)min((int)rtoTurnSpd + 20, (int)NAV_MAX_SPEED);
+                    wlogf("[RTO] Giro estancado — TurnSpd sube a %u\r\n", rtoTurnSpd);
+                }
+                rtoHdgPrev = heading; rtoLastCheckMs = nowMs;
+            }
+            if ((err * gTurnSign) > 0.0f) turnRight(rtoTurnSpd); else turnLeft(rtoTurnSpd);
         } else {
             moveForward(BASE_SPEED);
         }
