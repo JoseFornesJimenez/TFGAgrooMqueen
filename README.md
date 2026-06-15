@@ -12,7 +12,7 @@ El sistema completo se compone de tres repositorios:
 - **AgroMqueen (este repo)** — vehiculo autonomo (Heltec V3).
 - **[Estacion Base](https://github.com/JoseFornesJimenez/TFGEstacionBase)** — pasarela LoRa-USB (Heltec V2).
 - **[GCS web (mapa)](https://github.com/JoseFornesJimenez/TFGGCS)** — interfaz Flask + Leaflet para planificar y monitorizar misiones.
-
+- **[Sensor Humedad](https://github.com/JoseFornesJimenez/TFGModuloMoisture))** — Primer sensor modular.
 ```
 GCS web  <-- USB -->  Estacion base  <-- LoRa 868 MHz -->  Vehiculo (este repo)
 ```
