@@ -139,6 +139,10 @@ static void telnetHandle() {
 #define PIN_B_IN2      20
 #define PIN_B_ENB      47   // fijo HIGH
 
+// Módulo auxiliar (UART2)
+#define PIN_AUX_RX      1
+#define PIN_AUX_TX      2
+
 // LoRa SX1262 (integrado en la placa)
 #define PIN_LORA_SCK    9
 #define PIN_LORA_MISO  11
@@ -200,6 +204,9 @@ struct __attribute__((packed)) WaypointPacket {
     uint8_t checksum;       // XOR de todos los bytes anteriores
 };
 
+// ⚠️  BASE STATION NOTE: TelemetryPacket has grown by 5 bytes (uint8_t + float).
+//     sensorType and sensorValue were inserted BEFORE checksum.
+//     You MUST update the base station struct to match, or parsing will be wrong.
 struct __attribute__((packed)) TelemetryPacket {
     uint8_t  msgType;
     int32_t  latitude;          // microgrados × 1e6 (ej. 37283115 = 37.283115°)
@@ -212,7 +219,9 @@ struct __attribute__((packed)) TelemetryPacket {
     int16_t  rssi;
     float    snr;
     uint8_t  batteryLevel;
-    uint8_t  checksum;
+    uint8_t  sensorType;        // 0x00 = ninguno, 0x01 = humedad, etc.
+    float    sensorValue;       // última lectura del módulo auxiliar (-1.0 si sin dato)
+    uint8_t  checksum;          // XOR acumulado de todos los bytes anteriores
 };
 
 // =============================================================
@@ -231,6 +240,17 @@ static int gTurnSign = +1;
 static unsigned long lastTelemetryMs = 0;
 
 // =============================================================
+//  MÓDULO AUXILIAR — identificación y estado del sensor
+// =============================================================
+static uint8_t moduleType = 0x00;   // 0x00 = ninguno, 0x01 = humedad, etc.
+static String  moduleName = "";
+
+static float         ultimaLecturaSensor  = -1.0f;
+static bool          esperandoLecturaSensor = false;
+static unsigned long tiempoSolicitudSensor  = 0;
+static const unsigned long SENSOR_TIMEOUT   = 15000;
+
+// =============================================================
 //  OBJETOS
 // =============================================================
 U8G2_SSD1306_128X64_NONAME_F_SW_I2C
@@ -240,6 +260,7 @@ SX1262        radio = new Module(PIN_LORA_CS, PIN_LORA_DIO1,
                                  PIN_LORA_RST, PIN_LORA_BUSY);
 TinyGPSPlus    gps;
 HardwareSerial gpsSerial(1);
+HardwareSerial auxSerial(2);   // Módulo auxiliar — GPIO3 RX, GPIO4 TX
 Preferences    prefs;   // NVS — calibración HMC5883L
 
 // =============================================================
@@ -248,6 +269,9 @@ Preferences    prefs;   // NVS — calibración HMC5883L
 void motorsStop();
 void turnRight(uint8_t spd);
 void turnLeft(uint8_t spd);
+static void solicitarMedicion();
+static void procesarRespuestaSensor();
+static void medicionInicial();
 
 // Drena el buffer del GPS y el telnet sin bloquear.
 // Usar en lugar de delay() dentro de funciones largas.
@@ -1294,6 +1318,9 @@ void sendTelemetry() {
     if (pct < 0)   pct = 0;
     pkt.batteryLevel = (uint8_t)pct;
 
+    pkt.sensorType  = moduleType;
+    pkt.sensorValue = ultimaLecturaSensor;
+
     // Checksum = suma de todos los bytes excepto el último
     uint8_t *ptr = (uint8_t *)&pkt;
     uint8_t  chk = 0;
@@ -1353,6 +1380,20 @@ void navigate() {
         wlogf("[NAV] WP%u/%u alcanzado (dist=%.1fm)\r\n",
               currentWaypoint + 1, waypointCount, dist);
         oledShow("WP ALCANZADO!", "", "");
+
+        // Solicitar medición al módulo auxiliar y esperar respuesta (no bloqueante
+        // pero sí retiene el avance al siguiente WP hasta recibir dato o timeout)
+        if (moduleType != 0x00) {
+            solicitarMedicion();
+            unsigned long tWait = millis();
+            while (esperandoLecturaSensor && (millis() - tWait < SENSOR_TIMEOUT)) {
+                procesarRespuestaSensor();
+                while (gpsSerial.available()) gps.encode(gpsSerial.read());
+                telnetHandle();
+                delay(20);
+            }
+        }
+
         currentWaypoint++;
         if (currentWaypoint >= waypointCount) {
             navActive = false;
@@ -1497,6 +1538,176 @@ void navigate() {
 }
 
 // =============================================================
+//  MÓDULO AUXILIAR — funciones
+// =============================================================
+
+// Envía WHOAMI y espera hasta 3 s. Rellena moduleType y moduleName.
+static void auxModuleIdentify() {
+    wlogf("[AUX] ---- Inicio negociacion WHOAMI ----\r\n");
+    wlogf("[AUX] UART2: GPIO%d=RX  GPIO%d=TX  9600 baud\r\n", PIN_AUX_RX, PIN_AUX_TX);
+    wlogf("[AUX] TX >>> WHOAMI\\n\r\n");
+    auxSerial.print("WHOAMI\n");
+
+    String resp = "";
+    unsigned long t0 = millis();
+    bool gotNewline = false;
+    while (millis() - t0 < 3000) {
+        while (auxSerial.available()) {
+            char c = (char)auxSerial.read();
+            if (c == '\n') { gotNewline = true; goto parseResp; }
+            resp += c;
+        }
+        // Progreso cada 500 ms para saber que está esperando
+        static unsigned long lastDot = 0;
+        if (millis() - lastDot >= 500) {
+            lastDot = millis();
+            wlogf("[AUX] Esperando respuesta... (%lu ms, buf='%s')\r\n",
+                  millis() - t0, resp.c_str());
+        }
+        delay(10);
+    }
+
+parseResp:
+    wlogf("[AUX] RX <<< '%s'%s\r\n", resp.c_str(), gotNewline ? "\\n" : " (timeout sin \\n)");
+
+    // Descartar bytes basura al inicio (non-ASCII) — puede aparecer un byte espurio
+    // en el primer arranque del ESP32-C3 antes de que su UART se estabilice
+    int moduleIdx = resp.indexOf("MODULE:");
+    if (moduleIdx > 0) {
+        wlogf("[AUX] Descartando %d bytes basura al inicio\r\n", moduleIdx);
+        resp = resp.substring(moduleIdx);
+    }
+
+    // Expected format: MODULE:XX:Human Name
+    if (resp.startsWith("MODULE:") && resp.length() > 9) {
+        String hexPart  = resp.substring(7, 9);
+        String namePart = resp.substring(10);       // everything after "MODULE:XX:"
+        moduleType = (uint8_t)strtoul(hexPart.c_str(), nullptr, 16);
+        moduleName = namePart;
+        moduleName.trim();
+        wlogf("[AUX] Negociacion OK — tipo=0x%02X nombre='%s'\r\n",
+              moduleType, moduleName.c_str());
+        wlogf("[AUX] ---- Fin negociacion WHOAMI (EXITO) ----\r\n");
+        oledShow("Modulo AUX OK", moduleName.c_str(), "");
+        delay(1500);
+    } else {
+        moduleType = 0x00;
+        moduleName = "";
+        wlogf("[AUX] Negociacion FALLIDA — respuesta no reconocida\r\n");
+        wlogf("[AUX] ---- Fin negociacion WHOAMI (SIN MODULO) ----\r\n");
+        oledShow("Sin modulo AUX", "Continuando", "");
+        delay(1000);
+    }
+}
+
+// Solicita medición al módulo auxiliar de forma no bloqueante.
+static void solicitarMedicion() {
+    if (moduleType == 0x00) return;
+    if (esperandoLecturaSensor) return;   // ya hay una solicitud en curso
+    wlogf("[AUX] Solicitando medicion al modulo 0x%02X...\r\n", moduleType);
+    auxSerial.print("MEDIR\n");
+    esperandoLecturaSensor = true;
+    tiempoSolicitudSensor  = millis();
+}
+
+// Llama en cada iteración del loop(). Lee la respuesta del módulo si está disponible.
+// Parsea TYPE:VALUE\n — actualmente soporta HUMEDAD:XX pero el formato es genérico.
+static void procesarRespuestaSensor() {
+    if (!esperandoLecturaSensor) return;
+
+    // Timeout
+    if (millis() - tiempoSolicitudSensor > SENSOR_TIMEOUT) {
+        wlogf("[AUX] Timeout esperando respuesta del sensor\r\n");
+        esperandoLecturaSensor = false;
+        return;
+    }
+
+    // Leer bytes disponibles en el buffer del módulo auxiliar
+    static String auxBuf = "";
+    while (auxSerial.available()) {
+        char c = (char)auxSerial.read();
+        if (c == '\n') {
+            auxBuf.trim();
+            wlogf("[AUX] Recibido: '%s'\r\n", auxBuf.c_str());
+
+            // Parsear TYPE:VALUE
+            int colon = auxBuf.indexOf(':');
+            if (colon > 0) {
+                String tipo  = auxBuf.substring(0, colon);
+                String valor = auxBuf.substring(colon + 1);
+                // Accept HUMEDAD: or any future sensor type prefix
+                if (tipo.length() > 0 && valor.length() > 0) {
+                    ultimaLecturaSensor    = valor.toFloat();
+                    esperandoLecturaSensor = false;
+
+                    char msgBuf[32];
+                    snprintf(msgBuf, sizeof(msgBuf), "%s: %.1f%%",
+                             tipo.c_str(), ultimaLecturaSensor);
+                    wlogf("[AUX] Lectura valida — %s\r\n", msgBuf);
+
+                    // Mostrar en OLED 3 segundos
+                    oledShow("Sensor AUX", msgBuf, moduleName.c_str());
+                    delay(3000);
+                }
+            }
+
+            auxBuf = "";
+        } else {
+            auxBuf += c;
+        }
+    }
+}
+
+// Toma una medición inicial antes de arrancar la navegación.
+// Bloqueante hasta recibir respuesta o timeout.
+static void medicionInicial() {
+    if (moduleType == 0x00) return;
+    wlogf("[NAV] Tomando medicion inicial antes de navegar...\r\n");
+    oledShow("Midiendo...", moduleName.c_str(), "Antes de salir");
+
+    // Resetear estado por si quedó algo pendiente de antes
+    esperandoLecturaSensor = false;
+    solicitarMedicion();
+
+    // Timeout propio: SERVO_MOVE + SENSOR_SETTLE + SERVO_MOVE + margen = ~12s
+    // No reutilizamos SENSOR_TIMEOUT para no interferir con procesarRespuestaSensor()
+    const unsigned long MEDICION_INICIAL_TIMEOUT = 20000UL;
+    unsigned long t0 = millis();
+
+    while (millis() - t0 < MEDICION_INICIAL_TIMEOUT) {
+        // Leer bytes del módulo directamente aquí para no depender del timeout
+        // interno de procesarRespuestaSensor()
+        static String auxBufInit = "";
+        while (auxSerial.available()) {
+            char c = (char)auxSerial.read();
+            if (c == '\n') {
+                auxBufInit.trim();
+                wlogf("[AUX] Medicion inicial RX: '%s'\r\n", auxBufInit.c_str());
+                int colon = auxBufInit.indexOf(':');
+                if (colon > 0) {
+                    float val = auxBufInit.substring(colon + 1).toFloat();
+                    ultimaLecturaSensor    = val;
+                    esperandoLecturaSensor = false;
+                    wlogf("[NAV] Medicion inicial OK: %.1f\r\n", ultimaLecturaSensor);
+                    auxBufInit = "";
+                    goto medicionDone;
+                }
+                auxBufInit = "";
+            } else {
+                auxBufInit += c;
+            }
+        }
+        while (gpsSerial.available()) gps.encode(gpsSerial.read());
+        telnetHandle();
+        delay(20);
+    }
+    wlogf("[NAV] Medicion inicial timeout — continuando sin dato\r\n");
+
+medicionDone:
+    wlogf("[NAV] Medicion inicial completada (%.1f)\r\n", ultimaLecturaSensor);
+}
+
+// =============================================================
 //  SETUP
 // =============================================================
 void setup() {
@@ -1559,6 +1770,12 @@ void setup() {
         delay(3000);
     }
     delay(1000);
+
+    // ── Módulo auxiliar — UART2 ──
+    auxSerial.begin(9600, SERIAL_8N1, PIN_AUX_RX, PIN_AUX_TX);
+    delay(200);
+    auxModuleIdentify();
+
     wlogf("[SYS] Setup completado — entrando en loop");
 }
 
@@ -1728,6 +1945,7 @@ static bool processTelnetCmd(const char *cmd) {
         currentWaypoint = 0;
         waypointCount   = 0;
         if (requestWaypoints()) {
+            medicionInicial();
             navActive = true;
             gAdaptiveSpeed = BASE_SPEED;  // reset velocidad adaptativa
             char buf[22];
@@ -1837,6 +2055,7 @@ void loop() {
         wlogf("[SYS] Pidiendo waypoints...\r\n");
         oledShow("Pidiendo WP", "868MHz SF7...", "");
         if (requestWaypoints()) {
+            medicionInicial();
             navActive = true;
             gAdaptiveSpeed = BASE_SPEED;  // reset velocidad adaptativa
             wlogf("[SYS] Waypoints recibidos OK\r\n");
@@ -1848,6 +2067,9 @@ void loop() {
 
     // ── GPS — alimentar el parser ──
     while (gpsSerial.available()) gps.encode(gpsSerial.read());
+
+    // ── Módulo auxiliar — procesar respuesta si hay solicitud pendiente ──
+    procesarRespuestaSensor();
 
     // ── Navegación ──
     if (navActive) navigate();
